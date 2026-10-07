@@ -17,9 +17,12 @@ cargo test -- --include-ignored # plus an end-to-end test that runs ffmpeg
    frame rate, and the app records the mean RGB difference between consecutive frames.
 2. **Detect** (`scenes.rs`): cuts are found from those cached scores, either above a fixed
    threshold or relative to neighbouring frames (adaptive). A scene whose median motion is
-   below the still threshold is classified as a still. This step is instant, so the sliders
+   below the still threshold is classified as a still. Cuts can be shifted by a frame offset,
+   and frames can be dropped before/after each cut. This step is instant, so the settings
    update live.
-3. **Review** (`app.rs`): thumbnails, difference graph, per-scene Video/Still override,
-   include/exclude, merge with next.
+3. **Review** (`app.rs`, `player.rs`): thumbnails, difference graph, per-scene Video/Still
+   override, include/exclude, merge with next, and a video-only preview player whose
+   "loop selected scene" plays exactly the frames that will be exported.
+   Shortcuts: Space play/pause, ←/→ step one frame.
 4. **Export** (`export.rs`): clips via ffmpeg (exact re-encode or fast stream copy),
    stills as PNG of the scene's middle frame.

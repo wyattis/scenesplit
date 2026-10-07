@@ -99,21 +99,8 @@ mod tests {
     #[test]
     #[ignore = "needs ffmpeg on PATH"]
     fn splits_synthetic_video() {
-        let dir = std::env::temp_dir().join("scenesplit-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let input = dir.join("input.mp4");
-        let status = ffmpeg::command("ffmpeg")
-            .args(["-v", "error", "-y"])
-            .args(["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=3"])
-            .args(["-f", "lavfi", "-i", "color=c=navy:size=320x180:rate=25:duration=3"])
-            .args(["-f", "lavfi", "-i", "mandelbrot=size=320x180:rate=25"])
-            .args(["-filter_complex", "[2]trim=duration=3,setpts=PTS-STARTPTS[m];[0][1][m]concat=n=3:v=1[v]"])
-            .args(["-map", "[v]", "-pix_fmt", "yuv420p"])
-            .arg(&input)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let input = ffmpeg::make_test_video("analysis");
+        let dir = input.parent().unwrap();
 
         let info = ffmpeg::probe(&input).unwrap();
         let analysis = analyze(&input, &info, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
@@ -121,7 +108,7 @@ mod tests {
         let cuts = scenes::detect_cuts(&analysis.diffs, analysis.fps, &params);
         assert_eq!(cuts, vec![75, 150]);
 
-        let found = scenes::build_scenes(&analysis.diffs, analysis.frame_count(), &cuts, &HashSet::new(), params.still_threshold);
+        let found = scenes::build_scenes(&analysis.diffs, analysis.frame_count(), &cuts, &HashSet::new(), &params);
         let kinds: Vec<_> = found.iter().map(|s| s.kind).collect();
         assert_eq!(kinds, vec![SceneKind::Video, SceneKind::Still, SceneKind::Video]);
 

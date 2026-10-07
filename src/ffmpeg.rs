@@ -118,3 +118,24 @@ pub fn grab_frame_rgba(path: &Path, time: f64, width: u32, height: u32) -> Resul
     }
     Ok(buf)
 }
+
+/// Generates a 9 second, 25 fps test video: 3s moving pattern, 3s solid colour, 3s moving fractal.
+#[cfg(test)]
+pub fn make_test_video(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("scenesplit-test").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("input.mp4");
+    let status = command("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=3"])
+        .args(["-f", "lavfi", "-i", "color=c=navy:size=320x180:rate=25:duration=3"])
+        .args(["-f", "lavfi", "-i", "mandelbrot=size=320x180:rate=25"])
+        .args(["-filter_complex", "[2]trim=duration=3,setpts=PTS-STARTPTS[m];[0][1][m]concat=n=3:v=1[v]"])
+        .args(["-map", "[v]", "-pix_fmt", "yuv420p"])
+        .arg(&input)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    input
+}

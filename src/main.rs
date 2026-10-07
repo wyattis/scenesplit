@@ -5,6 +5,7 @@ mod analysis;
 mod app;
 mod export;
 mod ffmpeg;
+mod player;
 mod scenes;
 
 fn main() -> eframe::Result {
