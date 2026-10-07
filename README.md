@@ -26,3 +26,14 @@ cargo test -- --include-ignored # plus an end-to-end test that runs ffmpeg
    Shortcuts: Space play/pause, ←/→ step one frame.
 4. **Export** (`export.rs`): clips via ffmpeg (exact re-encode or fast stream copy),
    stills as PNG of the scene's middle frame.
+
+## Releases
+
+`.github/workflows/release.yml` builds x86_64 binaries for Windows, Linux and macOS.
+
+- Push a tag like `v0.1.0` to build and publish a GitHub Release with the archives attached.
+- Or run the workflow manually (Actions → Build → Run workflow) to get the archives as
+  run artifacts without creating a release.
+
+Binaries are unsigned: on macOS, right-click → Open the first time (or
+`xattr -d com.apple.quarantine scenesplit`); on Windows, SmartScreen → "More info" → "Run anyway".

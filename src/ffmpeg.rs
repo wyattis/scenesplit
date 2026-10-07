@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 /// Build a command that won't flash a console window on Windows.
 pub fn command(program: &str) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
