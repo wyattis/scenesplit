@@ -7,6 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Static GPL builds of ffmpeg bundled into each archive (see THIRD-PARTY-NOTICES.md).
+  BTBN_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
+  BTBN_BUILD: n9.0-latest
+  BTBN_SUFFIX: gpl-9.0
+  EVERMEET_VERSION: 9.0.2
 
 jobs:
   build:
@@ -22,7 +27,7 @@ jobs:
           - os: ubuntu-22.04 # oldest supported runner, so the binary works on older glibc
             target: x86_64-unknown-linux-gnu
             test: true
-          - os: macos-14 # Apple Silicon runner building for Intel; can't run the x86_64 tests
+          - os: macos-14 # Apple Silicon runner building for Intel; can't run the x86_64 binaries
             target: x86_64-apple-darwin
             test: false
     defaults:
@@ -46,10 +51,35 @@ jobs:
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
             libxrandr-dev libxi-dev libgl1-mesa-dev
 
-      # Unit tests only; the ffmpeg end-to-end tests are #[ignore]d.
+      - name: Fetch ffmpeg
+        run: |
+          mkdir -p ffmpeg-dl ffmpeg-bundle
+          case "$RUNNER_OS" in
+            Windows)
+              curl -fsSL -o ffmpeg-dl/ffmpeg.zip "$BTBN_URL/ffmpeg-$BTBN_BUILD-win64-$BTBN_SUFFIX.zip"
+              7z x -offmpeg-dl ffmpeg-dl/ffmpeg.zip > /dev/null
+              cp ffmpeg-dl/*/bin/ffmpeg.exe ffmpeg-dl/*/bin/ffprobe.exe ffmpeg-bundle/
+              ;;
+            Linux)
+              curl -fsSL "$BTBN_URL/ffmpeg-$BTBN_BUILD-linux64-$BTBN_SUFFIX.tar.xz" | tar xJ -C ffmpeg-dl
+              cp ffmpeg-dl/*/bin/ffmpeg ffmpeg-dl/*/bin/ffprobe ffmpeg-bundle/
+              ;;
+            macOS)
+              for tool in ffmpeg ffprobe; do
+                curl -fsSL -o "ffmpeg-dl/$tool.zip" "https://evermeet.cx/ffmpeg/$tool-$EVERMEET_VERSION.zip"
+                unzip -oq "ffmpeg-dl/$tool.zip" -d ffmpeg-bundle
+              done
+              ;;
+          esac
+          chmod +x ffmpeg-bundle/*
+          ls -l ffmpeg-bundle
+          # Make it available to the tests.
+          if [[ "$RUNNER_OS" == Windows ]]; then cygpath -w "$PWD/ffmpeg-bundle"; else echo "$PWD/ffmpeg-bundle"; fi >> "$GITHUB_PATH"
+
+      # Includes the #[ignore]d tests that need ffmpeg, now that it's on PATH.
       - name: Test
         if: matrix.test
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --release --target ${{ matrix.target }} -- --include-ignored
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -64,7 +94,12 @@ jobs:
           fi
           name="scenesplit-$version-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp README.md "dist/$name/"
+          cp README.md THIRD-PARTY-NOTICES.md licenses/ffmpeg-GPL-3.0.txt "dist/$name/"
+          # Next to the executable, where the app looks before PATH.
+          cp ffmpeg-bundle/* "dist/$name/"
+          if [[ "${{ matrix.test }}" == true ]]; then
+            "dist/$name/ffmpeg" -version | head -1
+          fi
           bin="target/${{ matrix.target }}/release/scenesplit"
           cd dist
           if [[ "${{ runner.os }}" == "Windows" ]]; then

@@ -13,6 +13,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::ffmpeg::{self, VideoInfo};
 
+/// Bump whenever the analysis output would change, to invalidate cached results.
+pub const ANALYSIS_VERSION: u32 = 1;
+
 /// Frames are downscaled to this size before comparing.
 const W: usize = 160;
 const H: usize = 90;
@@ -50,7 +53,7 @@ pub fn analyze(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to run ffmpeg (is it on PATH?)")?;
+        .context("couldn't run ffmpeg: put ffmpeg and ffprobe next to scenesplit, or install ffmpeg and add it to PATH")?;
     let mut stdout = child.stdout.take().unwrap();
 
     let expected = info.estimated_frames();

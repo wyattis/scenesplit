@@ -3,18 +3,26 @@
 Desktop app (Rust + egui) that splits a video made of multiple clips into separate
 clips, exporting static scenes as single PNG images.
 
-Requires `ffmpeg` and `ffprobe` on `PATH`.
+Uses `ffmpeg` and `ffprobe`: release archives include them next to the executable, which
+the app checks first; otherwise they need to be on `PATH`. The app shows a warning at
+startup if it can't find them.
 
 ```
 cargo run --release
-cargo test                      # unit tests
-cargo test -- --include-ignored # plus an end-to-end test that runs ffmpeg
+cargo test                      # unit + UI tests
+cargo test -- --include-ignored # plus end-to-end tests that run ffmpeg
 ```
+
+UI tests (`src/ui_tests.rs`) use `egui_kittest` to drive the widgets with real mouse and
+keyboard input: dragging cut markers, snapping, the right-click menu, zooming, the
+overview bar, the filmstrip, shortcuts, and a whole-app run that clicks real buttons.
 
 ## How it works
 
 1. **Analyze** (`analysis.rs`): ffmpeg decodes the video once at 160x90, at a constant
    frame rate, and the app records the mean RGB difference between consecutive frames.
+   Results are cached (`cache.rs`) in the user's cache directory, keyed by the video's
+   path, size and modification time, so reopening a video is instant.
 2. **Detect** (`scenes.rs`): cuts are found from those cached scores, either above a fixed
    threshold or relative to neighbouring frames (adaptive). A scene whose median motion is
    below the still threshold is classified as a still. Cuts can be shifted by a frame offset,
@@ -48,6 +56,9 @@ cargo test -- --include-ignored # plus an end-to-end test that runs ffmpeg
 
 `.github/workflows/release.yml` builds x86_64 binaries for Windows, Linux and macOS.
 
+- Each archive includes static GPL builds of `ffmpeg`/`ffprobe` 9.0 (BtbN builds for
+  Windows/Linux, evermeet.cx for macOS) plus `THIRD-PARTY-NOTICES.md` and the GPL text.
+  CI runs the full test suite, including the ffmpeg end-to-end tests, against them.
 - Push a tag like `v0.1.0` to build and publish a GitHub Release with the archives attached.
 - Or run the workflow manually (Actions → Build → Run workflow) to get the archives as
   run artifacts without creating a release.

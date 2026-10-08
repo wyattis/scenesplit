@@ -3,12 +3,15 @@
 
 mod analysis;
 mod app;
+mod cache;
 mod editor;
 mod export;
 mod ffmpeg;
 mod player;
 mod project;
 mod scenes;
+#[cfg(test)]
+mod ui_tests;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

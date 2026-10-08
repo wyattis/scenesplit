@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::egui::{
-    self, Color32, ColorImage, Event, Key, Rect, RichText, Sense, Shape, Stroke, TextureHandle, TextureOptions, vec2,
+    self, Color32, ColorImage, RichText, Sense, Shape, TextureHandle, TextureOptions, vec2,
 };
 
 use crate::analysis::{self, Analysis};
+use crate::cache;
 use crate::editor::{self, Action, EditorView, fmt_time};
 use crate::export::{self, CutMode, ExportItem};
 use crate::ffmpeg::{self, VideoInfo};
@@ -27,17 +28,17 @@ const ROW_SEPARATOR_AT: f32 = 104.0;
 const SAVE_DELAY: Duration = Duration::from_millis(800);
 const NOTICE_DURATION: Duration = Duration::from_secs(4);
 
-const VIDEO_COLOR: Color32 = Color32::from_rgb(70, 130, 200);
-const STILL_COLOR: Color32 = Color32::from_rgb(90, 170, 110);
 
 /// Messages from background threads. `generation` ties results to the video they were
 /// started for, so late results from a previously opened file are dropped.
 enum Msg {
     AnalysisProgress(f32),
-    AnalysisDone { generation: u64, path: PathBuf, result: Result<(VideoInfo, Analysis)> },
+    /// `cached` is true when the analysis came from the on-disk cache.
+    AnalysisDone { generation: u64, path: PathBuf, result: Result<(VideoInfo, Analysis, bool)> },
     Frames { generation: u64, kind: FrameKind, start: usize, size: [usize; 2], frames: Vec<Vec<u8>> },
     ExportProgress(usize),
     ExportDone(Result<Vec<PathBuf>>),
+    FfmpegChecked(Result<String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,8 @@ pub struct App {
     cancel: Arc<AtomicBool>,
     status: String,
     notice: Option<(String, Instant)>,
+    /// Result of checking for ffmpeg at startup: its version, or why it can't be used.
+    ffmpeg: Option<Result<String, String>>,
 
     params: Params,
     edits: Edits,
@@ -120,8 +123,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self::empty()
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let app = Self::empty();
+        let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::FfmpegChecked(ffmpeg::check()));
+            ctx.request_repaint();
+        });
+        app
     }
 
     fn empty() -> Self {
@@ -134,6 +143,7 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             status: "Open a video to begin (or drop one on the window).".into(),
             notice: None,
+            ffmpeg: None,
             params: Params::default(),
             edits: Edits::default(),
             history: History::default(),
@@ -205,11 +215,16 @@ impl App {
         let (tx, ctx, cancel, generation) = (self.tx.clone(), ctx.clone(), self.cancel.clone(), self.generation);
         std::thread::spawn(move || {
             let result = ffmpeg::probe(&path).and_then(|info| {
+                if let Some(analysis) = cache::load(&path) {
+                    return Ok((info, analysis, true));
+                }
                 let analysis = analysis::analyze(&path, &info, &cancel, |p| {
                     let _ = tx.send(Msg::AnalysisProgress(p));
                     ctx.request_repaint();
                 })?;
-                Ok((info, analysis))
+                // A failed cache write only costs a re-analysis next time.
+                let _ = cache::save(&path, &analysis);
+                Ok((info, analysis, false))
             });
             let _ = tx.send(Msg::AnalysisDone { generation, path, result });
             ctx.request_repaint();
@@ -478,7 +493,12 @@ impl App {
                 Msg::AnalysisDone { generation, path, result } if generation == self.generation => {
                     self.task = Task::Idle;
                     match result {
-                        Ok((info, analysis)) => self.on_analysis_done(ctx, path, info, analysis),
+                        Ok((info, analysis, cached)) => {
+                            self.on_analysis_done(ctx, path, info, analysis);
+                            if cached {
+                                self.status.push_str(" · analysis from cache");
+                            }
+                        }
                         Err(e) => self.status = format!("Analysis failed: {e:#}"),
                     }
                 }
@@ -499,6 +519,7 @@ impl App {
                         self.task = Task::Exporting { done, total };
                     }
                 }
+                Msg::FfmpegChecked(result) => self.ffmpeg = Some(result.map_err(|e| format!("{e:#}"))),
                 Msg::ExportDone(result) => {
                     self.task = Task::Idle;
                     if let Some(l) = &self.loaded {
@@ -514,37 +535,10 @@ impl App {
     }
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.loaded.is_none() || ctx.memory(|m| m.focused().is_some()) {
+        if self.loaded.is_none() {
             return;
         }
-        let keys: Vec<(Key, egui::Modifiers)> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
-                    _ => None,
-                })
-                .collect()
-        });
-        for (key, m) in keys {
-            let step = if m.shift { 10 } else { 1 };
-            let action = match key {
-                Key::Z if m.command && m.shift => Action::Redo,
-                Key::Z if m.command => Action::Undo,
-                Key::Y if m.command => Action::Redo,
-                _ if m.command || m.alt => continue,
-                Key::Space => Action::TogglePlay,
-                Key::ArrowLeft => Action::Step(-step),
-                Key::ArrowRight => Action::Step(step),
-                Key::S => Action::Split,
-                Key::Delete | Key::Backspace => Action::DeleteSelected,
-                Key::Comma => Action::Nudge(-step),
-                Key::Period => Action::Nudge(step),
-                Key::OpenBracket => Action::JumpCut(-1),
-                Key::CloseBracket => Action::JumpCut(1),
-                Key::Escape => Action::SelectCut(None),
-                _ => continue,
-            };
+        for action in editor::shortcut_actions(ctx) {
             self.apply(action);
         }
     }
@@ -591,7 +585,17 @@ impl App {
                 }
                 Task::Idle => {}
             }
-            ui.label(&self.status);
+            match &self.ffmpeg {
+                Some(Err(e)) => {
+                    ui.label(RichText::new(format!("⚠ {e}")).color(ui.visuals().error_fg_color));
+                }
+                Some(Ok(version)) => {
+                    ui.label(&self.status).on_hover_text(version);
+                }
+                None => {
+                    ui.label(&self.status);
+                }
+            }
             if let Some((text, at)) = &self.notice {
                 if at.elapsed() < NOTICE_DURATION {
                     ui.label(RichText::new(text).color(ui.visuals().warn_fg_color));
@@ -748,7 +752,16 @@ impl App {
             }
         }
 
-        actions.extend(timeline(ui, l, &self.edits, self.selected, &self.view));
+        let overview = editor::OverviewInput {
+            scenes: &l.scenes,
+            edits: &self.edits,
+            selected: self.selected,
+            frame_count: l.player.frame_count(),
+            fps: l.analysis.fps,
+            shown_frame: l.player.current_frame(),
+            position: l.player.position(),
+        };
+        actions.extend(editor::overview(ui, &overview, &self.view));
 
         let current = player.current_frame();
         let here = l.scene_at(current);
@@ -982,67 +995,6 @@ impl eframe::App for App {
     }
 }
 
-/// Overview of the whole video: every scene's exported frames (blue = clip, green = still,
-/// faded = not exported), the selected scene, the graph's zoom window, and the playhead.
-/// Click a clip to select it (the playhead moves to the click); drag to scrub.
-fn timeline(ui: &mut egui::Ui, l: &Loaded, edits: &Edits, selected: Option<CutId>, view: &EditorView) -> Option<Action> {
-    let total = l.player.frame_count().max(1);
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click_and_drag());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-    let to_x = |frame: f64| rect.left() + (frame / total as f64) as f32 * rect.width();
-    let frame_at = |x: f32| ((((x - rect.left()) / rect.width()) * total as f32).max(0.0) as usize).min(total - 1);
-    let hovered = response.hover_pos().map(|p| l.scene_at(frame_at(p.x)));
-
-    for (i, scene) in l.scenes.iter().enumerate() {
-        let full = Rect::from_x_y_ranges(to_x(scene.start as f64)..=to_x(scene.end as f64), rect.y_range());
-        if hovered == Some(i) {
-            painter.rect_filled(full, 1.0, ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.5));
-        }
-        if !scene.keep.is_empty() {
-            let color = match edits.kinds.get(&scene.id).copied().unwrap_or(scene.kind) {
-                SceneKind::Video => VIDEO_COLOR,
-                SceneKind::Still => STILL_COLOR,
-            };
-            let alpha = if edits.excluded.contains(&scene.id) { 0.2 } else { 0.6 };
-            let r = Rect::from_x_y_ranges(to_x(scene.keep.start as f64)..=to_x(scene.keep.end as f64), rect.y_range())
-                .shrink2(vec2(0.5, 3.0));
-            painter.rect_filled(r, 1.0, color.gamma_multiply(alpha));
-        }
-        if selected == Some(scene.id) {
-            let r = full.shrink2(vec2(0.5, 1.0));
-            painter.rect_stroke(r, 2.0, Stroke::new(2.0, editor::DETECTED_COLOR), egui::StrokeKind::Inside);
-        }
-    }
-    if view.is_zoomed() {
-        let r = Rect::from_x_y_ranges(to_x(view.start)..=to_x(view.end), rect.y_range());
-        let stroke = Stroke::new(1.0, ui.visuals().strong_text_color().gamma_multiply(0.7));
-        painter.rect_stroke(r, 1.0, stroke, egui::StrokeKind::Inside);
-    }
-    let x = to_x(l.player.current_frame() as f64);
-    painter.vline(x, rect.y_range(), Stroke::new(2.0, ui.visuals().strong_text_color()));
-
-    let response = match hovered.and_then(|i| l.scenes.get(i).map(|s| (i, s))) {
-        Some((i, s)) if !response.dragged() => response.on_hover_text(format!(
-            "Scene #{}  {} – {}\nClick to select, drag to scrub",
-            i + 1,
-            fmt_time(l.analysis.frame_time(s.start)),
-            fmt_time(l.analysis.frame_time(s.end)),
-        )),
-        _ => response,
-    };
-
-    let frame = frame_at(response.interact_pointer_pos()?.x);
-    if response.clicked() {
-        Some(Action::SelectSceneAt { index: l.scene_at(frame), frame })
-    } else if response.dragged() && frame != l.player.position() {
-        // Only seek when the frame changes, so holding still doesn't restart the decoder.
-        Some(Action::Seek(frame))
-    } else {
-        None
-    }
-}
-
 /// Background thread that decodes thumbnails and filmstrip frames on request. Exits when the
 /// sender is dropped (i.e. when another video is opened).
 fn spawn_frame_worker(
@@ -1090,6 +1042,22 @@ fn default_out_dir(input: &Path) -> PathBuf {
     input.parent().unwrap_or(Path::new(".")).join(format!("{stem}_scenes"))
 }
 
+/// Hooks for the UI tests in `ui_tests.rs`.
+#[cfg(test)]
+impl App {
+    pub(crate) fn open_for_test(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.open(ctx, path);
+    }
+
+    pub(crate) fn scene_count(&self) -> Option<usize> {
+        self.loaded.as_ref().map(|l| l.scenes.len())
+    }
+
+    pub(crate) fn cut_frames(&self) -> Vec<usize> {
+        self.loaded.as_ref().map_or(Vec::new(), |l| l.cuts.cuts.iter().map(|c| c.frame).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1109,13 +1077,7 @@ mod tests {
         let input = ffmpeg::make_test_video("app");
         let ctx = egui::Context::default();
         let mut app = App::empty();
-        app.open(&ctx, input.clone());
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while app.loaded.is_none() {
-            assert!(Instant::now() < deadline, "analysis timed out: {}", app.status);
-            app.handle_messages(&ctx);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        open_and_wait(&ctx, &mut app, &input);
         assert_eq!(cut_frames(&app), [(75, CutSource::Detected), (150, CutSource::Detected)]);
 
         // Jump to the next cut from the start, nudge it twice (one undo step), then back.
@@ -1177,8 +1139,21 @@ mod tests {
         assert_eq!(saved.params.cut_offset, 2);
         assert_eq!(saved.edits, app.edits);
         let mut reopened = App::empty();
-        reopened.open(&ctx, input.clone());
+        open_and_wait(&ctx, &mut reopened, &input);
         assert_eq!(reopened.edits, app.edits);
         assert_eq!(reopened.params, app.params);
+        // The second open skips decoding and gets the same scores.
+        assert!(reopened.status.contains("analysis from cache"), "{}", reopened.status);
+        assert_eq!(reopened.loaded.as_ref().unwrap().analysis.diffs, app.loaded.as_ref().unwrap().analysis.diffs);
+    }
+
+    fn open_and_wait(ctx: &egui::Context, app: &mut App, path: &Path) {
+        app.open(ctx, path.to_path_buf());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.loaded.is_none() {
+            assert!(Instant::now() < deadline, "analysis timed out: {}", app.status);
+            app.handle_messages(ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

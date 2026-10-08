@@ -1,16 +1,40 @@
 //! Thin wrappers around the `ffmpeg` / `ffprobe` command-line tools.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-/// Build a command that won't flash a console window on Windows.
+/// Where `program` (`ffmpeg` or `ffprobe`) will be run from: next to our own executable if
+/// it's there (release archives ship it that way), otherwise whatever is on PATH.
+pub fn resolve(program: &str) -> (PathBuf, Source) {
+    let exe = std::env::current_exe().ok();
+    resolve_in(exe.as_deref().and_then(Path::parent), program)
+}
+
+fn resolve_in(app_dir: Option<&Path>, program: &str) -> (PathBuf, Source) {
+    let bundled = app_dir
+        .map(|dir| dir.join(format!("{program}{}", std::env::consts::EXE_SUFFIX)))
+        .filter(|p| p.is_file());
+    match bundled {
+        Some(path) => (path, Source::Bundled),
+        None => (PathBuf::from(program), Source::Path),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Bundled,
+    Path,
+}
+
+/// Build a command for `ffmpeg`/`ffprobe` (see [`resolve`]) that won't flash a console
+/// window on Windows.
 pub fn command(program: &str) -> Command {
     #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(resolve(program).0);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -18,6 +42,28 @@ pub fn command(program: &str) -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+const MISSING: &str = "couldn't run ffprobe: put ffmpeg and ffprobe next to scenesplit, or install ffmpeg and add it to PATH";
+
+/// Checks that both tools run. Returns e.g. "ffmpeg 9.0.2 (bundled)".
+pub fn check() -> Result<String> {
+    let mut version = String::new();
+    for program in ["ffprobe", "ffmpeg"] {
+        let out = command(program).arg("-version").output().map_err(|_| anyhow::anyhow!(
+            "{program} not found: put ffmpeg and ffprobe next to scenesplit, or install ffmpeg and add it to PATH"
+        ))?;
+        if !out.status.success() {
+            bail!("{program} -version failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        // "ffmpeg version 9.0.2 Copyright ..." -> "9.0.2"
+        version = String::from_utf8_lossy(&out.stdout).split_whitespace().nth(2).unwrap_or("?").to_owned();
+    }
+    let source = match resolve("ffmpeg").1 {
+        Source::Bundled => "bundled",
+        Source::Path => "from PATH",
+    };
+    Ok(format!("ffmpeg {version} ({source})"))
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +114,7 @@ pub fn probe(path: &Path) -> Result<VideoInfo> {
         .args(["-of", "json"])
         .arg(path)
         .output()
-        .context("failed to run ffprobe (is it on PATH?)")?;
+        .context(MISSING)?;
     if !out.status.success() {
         bail!("ffprobe failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -167,5 +213,33 @@ mod tests {
         // Asking past the end returns what exists rather than failing.
         let tail = grab_frames_rgba(&input, 220, 13, info.fps, 64, 36).unwrap();
         assert_eq!(tail.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    #[test]
+    fn falls_back_to_path_when_nothing_is_bundled() {
+        // Test binaries live in target/*/deps, where no ffmpeg is bundled.
+        assert_eq!(resolve("ffmpeg"), (PathBuf::from("ffmpeg"), Source::Path));
+    }
+
+    #[test]
+    fn prefers_a_copy_next_to_the_app() {
+        let dir = std::env::temp_dir().join("scenesplit-test").join("bundled");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundled = dir.join(format!("ffprobe{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&bundled, b"").unwrap();
+        assert_eq!(resolve_in(Some(&dir), "ffprobe"), (bundled, Source::Bundled));
+        assert_eq!(resolve_in(Some(&dir), "ffmpeg"), (PathBuf::from("ffmpeg"), Source::Path));
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg on PATH"]
+    fn check_reports_version_and_source() {
+        let version = check().unwrap();
+        assert!(version.starts_with("ffmpeg ") && version.ends_with("(from PATH)"), "{version}");
     }
 }

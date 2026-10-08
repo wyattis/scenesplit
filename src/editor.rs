@@ -7,10 +7,12 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use eframe::egui::{
-    self, Color32, CursorIcon, FontId, Rect, RichText, Sense, Shape, Stroke, TextureHandle, pos2, vec2,
+    self, Color32, CursorIcon, Event, FontId, Key, Modifiers, Rect, RichText, Sense, Shape, Stroke, TextureHandle,
+    WidgetInfo, WidgetType, pos2, vec2,
 };
 
-use crate::scenes::{Cut, CutId, CutSource, ResolvedCuts, SceneKind};
+use crate::project::Edits;
+use crate::scenes::{Cut, CutId, CutSource, ResolvedCuts, Scene, SceneKind};
 
 pub const DETECTED_COLOR: Color32 = Color32::from_rgb(230, 120, 40);
 pub const MOVED_COLOR: Color32 = Color32::from_rgb(240, 200, 60);
@@ -39,6 +41,7 @@ pub const SHORTCUTS: &str = "Space  play / pause\n\
     double-click to add a cut, right-click for more,\n\
     Ctrl+scroll to zoom, scroll to pan.";
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Seek(usize),
     Step(i64),
@@ -69,6 +72,44 @@ pub enum Action {
     ZoomToSelectedScene,
     SetKind(CutId, SceneKind),
     SetExcluded(CutId, bool),
+}
+
+/// Actions for this frame's key presses. Nothing while a widget (e.g. a number field) has
+/// keyboard focus, so typing there doesn't trigger shortcuts.
+pub fn shortcut_actions(ctx: &egui::Context) -> Vec<Action> {
+    if ctx.memory(|m| m.focused().is_some()) {
+        return Vec::new();
+    }
+    ctx.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Key { key, pressed: true, modifiers, .. } => shortcut(*key, *modifiers),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+fn shortcut(key: Key, m: Modifiers) -> Option<Action> {
+    let step = if m.shift { 10 } else { 1 };
+    Some(match key {
+        Key::Z if m.command && m.shift => Action::Redo,
+        Key::Z if m.command => Action::Undo,
+        Key::Y if m.command => Action::Redo,
+        _ if m.command || m.alt => return None,
+        Key::Space => Action::TogglePlay,
+        Key::ArrowLeft => Action::Step(-step),
+        Key::ArrowRight => Action::Step(step),
+        Key::S => Action::Split,
+        Key::Delete | Key::Backspace => Action::DeleteSelected,
+        Key::Comma => Action::Nudge(-step),
+        Key::Period => Action::Nudge(step),
+        Key::OpenBracket => Action::JumpCut(-1),
+        Key::CloseBracket => Action::JumpCut(1),
+        Key::Escape => Action::SelectCut(None),
+        _ => return None,
+    })
 }
 
 /// View state of the cut editor that persists between frames.
@@ -438,6 +479,85 @@ fn legend(ui: &mut egui::Ui) {
     }
 }
 
+pub const VIDEO_COLOR: Color32 = Color32::from_rgb(70, 130, 200);
+pub const STILL_COLOR: Color32 = Color32::from_rgb(90, 170, 110);
+
+pub struct OverviewInput<'a> {
+    pub scenes: &'a [Scene],
+    pub edits: &'a Edits,
+    pub selected: Option<CutId>,
+    pub frame_count: usize,
+    pub fps: f64,
+    /// Frame on screen in the player.
+    pub shown_frame: usize,
+    /// Frame the player is at or heading to (see `Player::position`).
+    pub position: usize,
+}
+
+pub const OVERVIEW_HEIGHT: f32 = 22.0;
+
+/// The bar under the video: every scene's exported frames (blue = clip, green = still,
+/// faded = not exported), the selected scene, the graph's zoom window, and the playhead.
+/// Click a clip to select it (the playhead moves to the click); drag to scrub.
+pub fn overview(ui: &mut egui::Ui, input: &OverviewInput<'_>, view: &EditorView) -> Option<Action> {
+    let total = input.frame_count.max(1);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), OVERVIEW_HEIGHT), Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    let to_x = |frame: f64| rect.left() + (frame / total as f64) as f32 * rect.width();
+    let frame_at = |x: f32| ((((x - rect.left()) / rect.width()) * total as f32).max(0.0) as usize).min(total - 1);
+    let scene_at = |frame: usize| input.scenes.partition_point(|s| s.start <= frame).saturating_sub(1);
+    let hovered = response.hover_pos().map(|p| scene_at(frame_at(p.x)));
+
+    for (i, scene) in input.scenes.iter().enumerate() {
+        let full = Rect::from_x_y_ranges(to_x(scene.start as f64)..=to_x(scene.end as f64), rect.y_range());
+        if hovered == Some(i) {
+            painter.rect_filled(full, 1.0, ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.5));
+        }
+        if !scene.keep.is_empty() {
+            let color = match input.edits.kinds.get(&scene.id).copied().unwrap_or(scene.kind) {
+                SceneKind::Video => VIDEO_COLOR,
+                SceneKind::Still => STILL_COLOR,
+            };
+            let alpha = if input.edits.excluded.contains(&scene.id) { 0.2 } else { 0.6 };
+            let r = Rect::from_x_y_ranges(to_x(scene.keep.start as f64)..=to_x(scene.keep.end as f64), rect.y_range())
+                .shrink2(vec2(0.5, 3.0));
+            painter.rect_filled(r, 1.0, color.gamma_multiply(alpha));
+        }
+        if input.selected == Some(scene.id) {
+            let r = full.shrink2(vec2(0.5, 1.0));
+            painter.rect_stroke(r, 2.0, Stroke::new(2.0, DETECTED_COLOR), egui::StrokeKind::Inside);
+        }
+    }
+    if view.is_zoomed() {
+        let r = Rect::from_x_y_ranges(to_x(view.start)..=to_x(view.end), rect.y_range());
+        let stroke = Stroke::new(1.0, ui.visuals().strong_text_color().gamma_multiply(0.7));
+        painter.rect_stroke(r, 1.0, stroke, egui::StrokeKind::Inside);
+    }
+    let x = to_x(input.shown_frame as f64);
+    painter.vline(x, rect.y_range(), Stroke::new(2.0, ui.visuals().strong_text_color()));
+
+    let response = match hovered.and_then(|i| input.scenes.get(i).map(|s| (i, s))) {
+        Some((i, s)) if !response.dragged() => response.on_hover_text(format!(
+            "Scene #{}  {} – {}\nClick to select, drag to scrub",
+            i + 1,
+            fmt_time(s.start as f64 / input.fps),
+            fmt_time(s.end as f64 / input.fps),
+        )),
+        _ => response,
+    };
+
+    let frame = frame_at(response.interact_pointer_pos()?.x);
+    if response.clicked() {
+        Some(Action::SelectSceneAt { index: scene_at(frame), frame })
+    } else if response.dragged() && frame != input.position {
+        // Only seek when the frame changes, so holding still doesn't restart the decoder.
+        Some(Action::Seek(frame))
+    } else {
+        None
+    }
+}
+
 pub struct StripInput<'a> {
     pub cut: Cut,
     pub frame_count: usize,
@@ -488,6 +608,7 @@ pub fn filmstrip(ui: &mut egui::Ui, input: &StripInput<'_>) -> (Vec<Action>, Ran
             }
             ui.vertical(|ui| {
                 let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Frame {f}")));
                 match input.frames.get(&f) {
                     Some(tex) => {
                         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
