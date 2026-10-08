@@ -24,7 +24,24 @@ cargo test -- --include-ignored # plus an end-to-end test that runs ffmpeg
    override, include/exclude, merge with next, and a video-only preview player whose
    "loop selected scene" plays exactly the frames that will be exported.
    Shortcuts: Space play/pause, ←/→ step one frame.
-4. **Export** (`export.rs`): clips via ffmpeg (exact re-encode or fast stream copy),
+4. **Edit cuts** (`editor.rs`, `project.rs`): drag cut markers on the difference graph
+   (snaps to nearby spikes; hold Alt to disable), double-click to add a cut, right-click
+   for more. Ctrl+scroll zooms the graph, scroll pans. Selecting a cut shows a filmstrip of
+   the frames around it; click the frame that should start the new scene. Hand-placed cuts
+   ignore the cut offset. Edits are undoable and auto-saved next to the video as
+   `<video>.scenesplit.json`, along with the detection settings.
+
+   | Key | Action |
+   |---|---|
+   | Space | play / pause |
+   | ← → | step one frame (Shift: 10) |
+   | S | split at playhead |
+   | Delete | delete selected cut |
+   | , . | nudge selected cut (Shift: 10) |
+   | [ ] | previous / next cut |
+   | Esc | deselect cut |
+   | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | undo, redo |
+5. **Export** (`export.rs`): clips via ffmpeg (exact re-encode or fast stream copy),
    stills as PNG of the scene's middle frame.
 
 ## Releases

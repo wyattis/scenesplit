@@ -91,8 +91,7 @@ fn mean_abs_diff(a: &[u8], b: &[u8]) -> f32 {
 mod tests {
     use super::*;
     use crate::export::{self, CutMode, ExportItem};
-    use crate::scenes::{self, Params, SceneKind};
-    use std::collections::HashSet;
+    use crate::scenes::{self, CutEdits, Params, SceneKind};
 
     /// End-to-end check against real ffmpeg: moving clip, static frame, moving clip.
     /// Run with `cargo test -- --ignored`.
@@ -108,7 +107,8 @@ mod tests {
         let cuts = scenes::detect_cuts(&analysis.diffs, analysis.fps, &params);
         assert_eq!(cuts, vec![75, 150]);
 
-        let found = scenes::build_scenes(&analysis.diffs, analysis.frame_count(), &cuts, &HashSet::new(), &params);
+        let resolved = scenes::resolve_cuts(&cuts, &CutEdits::default(), analysis.frame_count(), params.cut_offset);
+        let found = scenes::build_scenes(&analysis.diffs, analysis.frame_count(), &resolved.cuts, &params);
         let kinds: Vec<_> = found.iter().map(|s| s.kind).collect();
         assert_eq!(kinds, vec![SceneKind::Video, SceneKind::Still, SceneKind::Video]);
 

@@ -3,22 +3,30 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::egui::{
-    self, Color32, ColorImage, Key, Rect, RichText, Sense, Shape, Stroke, TextureHandle, TextureOptions, pos2, vec2,
+    self, Color32, ColorImage, Event, Key, Rect, RichText, Sense, Shape, Stroke, TextureHandle, TextureOptions, vec2,
 };
 
 use crate::analysis::{self, Analysis};
+use crate::editor::{self, Action, EditorView, fmt_time};
 use crate::export::{self, CutMode, ExportItem};
 use crate::ffmpeg::{self, VideoInfo};
 use crate::player::Player;
-use crate::scenes::{self, DetectMode, Params, Scene, SceneKind};
+use crate::project::{self, Edits, History, Project};
+use crate::scenes::{self, CutEdits, CutId, CutSource, DetectMode, Params, ResolvedCuts, Scene, SceneKind};
 
 const THUMB_W: u32 = 192;
-const ROW_HEIGHT: f32 = 112.0;
+const STRIP_W: u32 = 160;
+const ROW_HEIGHT: f32 = 120.0;
+/// Height of a scene row's content; the separator sits below it.
+const ROW_SEPARATOR_AT: f32 = 104.0;
+/// Edits are saved this long after the last change.
+const SAVE_DELAY: Duration = Duration::from_millis(800);
+const NOTICE_DURATION: Duration = Duration::from_secs(4);
 
-const ACCENT: Color32 = Color32::from_rgb(230, 120, 40);
 const VIDEO_COLOR: Color32 = Color32::from_rgb(70, 130, 200);
 const STILL_COLOR: Color32 = Color32::from_rgb(90, 170, 110);
 
@@ -27,9 +35,21 @@ const STILL_COLOR: Color32 = Color32::from_rgb(90, 170, 110);
 enum Msg {
     AnalysisProgress(f32),
     AnalysisDone { generation: u64, path: PathBuf, result: Result<(VideoInfo, Analysis)> },
-    Thumb { generation: u64, frame: usize, size: [usize; 2], rgba: Vec<u8> },
+    Frames { generation: u64, kind: FrameKind, start: usize, size: [usize; 2], frames: Vec<Vec<u8>> },
     ExportProgress(usize),
     ExportDone(Result<Vec<PathBuf>>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    Thumb,
+    Strip,
+}
+
+struct FrameJob {
+    kind: FrameKind,
+    start: usize,
+    count: usize,
 }
 
 enum Task {
@@ -38,23 +58,15 @@ enum Task {
     Exporting { done: usize, total: usize },
 }
 
-/// Player requests collected while drawing the UI and applied afterwards, which keeps the
-/// drawing code free of borrow conflicts.
-enum Action {
-    Seek(usize),
-    Step(i64),
-    TogglePlay,
-    /// Select scene by index and jump to it, optionally starting playback.
-    SelectScene { index: usize, play: bool },
-}
-
 struct Loaded {
     path: PathBuf,
     info: VideoInfo,
     analysis: Analysis,
-    cuts: Vec<usize>,
+    /// Cuts found by detection, before the user's edits.
+    detected: Vec<usize>,
+    cuts: ResolvedCuts,
     scenes: Vec<Scene>,
-    thumb_tx: Sender<usize>,
+    frame_tx: Sender<FrameJob>,
     player: Player,
 }
 
@@ -62,6 +74,10 @@ impl Loaded {
     /// Index of the scene containing `frame`.
     fn scene_at(&self, frame: usize) -> usize {
         self.scenes.partition_point(|s| s.start <= frame).saturating_sub(1)
+    }
+
+    fn frame_count(&self) -> usize {
+        self.analysis.frame_count()
     }
 }
 
@@ -72,20 +88,32 @@ pub struct App {
     task: Task,
     cancel: Arc<AtomicBool>,
     status: String,
+    notice: Option<(String, Instant)>,
 
     params: Params,
+    edits: Edits,
+    history: History,
     loaded: Option<Loaded>,
-    /// Detected cuts the user merged away.
-    merged: HashSet<usize>,
-    /// Per-scene user choices, keyed by `Scene::id`.
-    kind_overrides: HashMap<usize, SceneKind>,
-    excluded: HashSet<usize>,
+    /// Video the current params/edits belong to (set as soon as a file is opened).
+    video_path: Option<PathBuf>,
+    dirty_since: Option<Instant>,
+    /// Set when the saved project couldn't be read, so we don't overwrite it.
+    save_blocked: bool,
+
     /// `Scene::id` of the selected scene.
-    selected: Option<usize>,
+    selected: Option<CutId>,
+    selected_cut: Option<CutId>,
     loop_scene: bool,
+    view: EditorView,
+    /// Scene list row to bring into view on the next frame.
+    scroll_to_scene: Option<usize>,
+    /// Rows fully visible in the scene list last frame.
+    visible_rows: std::ops::Range<usize>,
 
     thumbs: HashMap<usize, TextureHandle>,
     thumbs_requested: HashSet<usize>,
+    strip: HashMap<usize, TextureHandle>,
+    strip_requested: HashSet<usize>,
 
     out_dir: Option<PathBuf>,
     cut_mode: CutMode,
@@ -93,6 +121,10 @@ pub struct App {
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Self::empty()
+    }
+
+    fn empty() -> Self {
         let (tx, rx) = channel();
         Self {
             tx,
@@ -101,15 +133,24 @@ impl App {
             task: Task::Idle,
             cancel: Arc::new(AtomicBool::new(false)),
             status: "Open a video to begin (or drop one on the window).".into(),
+            notice: None,
             params: Params::default(),
+            edits: Edits::default(),
+            history: History::default(),
             loaded: None,
-            merged: HashSet::new(),
-            kind_overrides: HashMap::new(),
-            excluded: HashSet::new(),
+            video_path: None,
+            dirty_since: None,
+            save_blocked: false,
             selected: None,
+            selected_cut: None,
             loop_scene: true,
+            view: EditorView::new(1),
+            scroll_to_scene: None,
+            visible_rows: 0..0,
             thumbs: HashMap::new(),
             thumbs_requested: HashSet::new(),
+            strip: HashMap::new(),
+            strip_requested: HashSet::new(),
             out_dir: None,
             cut_mode: CutMode::Exact,
         }
@@ -119,17 +160,44 @@ impl App {
         !matches!(self.task, Task::Idle)
     }
 
+    fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), Instant::now()));
+    }
+
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.dirty_since.is_some() {
+            self.save_project();
+        }
         self.cancel.store(true, Ordering::Relaxed);
         self.generation += 1;
         self.loaded = None;
-        self.merged.clear();
-        self.kind_overrides.clear();
-        self.excluded.clear();
         self.selected = None;
+        self.selected_cut = None;
         self.thumbs.clear();
         self.thumbs_requested.clear();
+        self.strip.clear();
+        self.strip_requested.clear();
+        self.history = History::default();
+        self.dirty_since = None;
+        self.save_blocked = false;
         self.out_dir = Some(default_out_dir(&path));
+
+        // Settings carry over from the previous video unless this one has its own saved.
+        self.edits = Edits::default();
+        match project::load(&path) {
+            Ok(Some(p)) => {
+                self.params = p.params;
+                self.edits = p.edits;
+                self.notify(format!("Loaded saved edits from {}", project::sidecar_path(&path).display()));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.save_blocked = true;
+                self.notify(format!("{e:#}. Edits won't be saved, to avoid overwriting it."));
+            }
+        }
+        self.video_path = Some(path.clone());
+
         self.cancel = Arc::new(AtomicBool::new(false));
         self.task = Task::Analyzing(0.0);
         self.status = format!("Analyzing {}…", path.display());
@@ -149,8 +217,9 @@ impl App {
     }
 
     fn on_analysis_done(&mut self, ctx: &egui::Context, path: PathBuf, info: VideoInfo, analysis: Analysis) {
-        let thumb_tx = spawn_thumb_worker(ctx.clone(), self.tx.clone(), self.generation, path.clone(), &info, analysis.fps);
+        let frame_tx = spawn_frame_worker(ctx.clone(), self.tx.clone(), self.generation, path.clone(), &info, analysis.fps);
         let player = Player::new(&path, &info, analysis.fps, analysis.frame_count());
+        self.view = EditorView::new(analysis.frame_count());
         self.status = format!(
             "{} · {}×{} · {:.2} fps · {}{}",
             path.file_name().unwrap_or_default().to_string_lossy(),
@@ -160,19 +229,57 @@ impl App {
             fmt_time(info.duration),
             if info.has_audio { " · audio" } else { "" },
         );
-        self.loaded = Some(Loaded { path, info, analysis, cuts: Vec::new(), scenes: Vec::new(), thumb_tx, player });
+        self.loaded = Some(Loaded {
+            path,
+            info,
+            analysis,
+            detected: Vec::new(),
+            cuts: ResolvedCuts::default(),
+            scenes: Vec::new(),
+            frame_tx,
+            player,
+        });
         self.recompute();
     }
 
-    /// Re-run cut detection on the cached scores. Cheap; called whenever settings change.
+    /// Re-run detection and apply edits. Cheap; called whenever settings or edits change.
     fn recompute(&mut self) {
         let Some(l) = &mut self.loaded else { return };
-        l.cuts = scenes::detect_cuts(&l.analysis.diffs, l.analysis.fps, &self.params);
-        l.scenes = scenes::build_scenes(&l.analysis.diffs, l.analysis.frame_count(), &l.cuts, &self.merged, &self.params);
+        let fc = l.frame_count();
+        l.detected = scenes::detect_cuts(&l.analysis.diffs, l.analysis.fps, &self.params);
+        l.cuts = scenes::resolve_cuts(&l.detected, &self.edits.cuts, fc, self.params.cut_offset);
+        l.scenes = scenes::build_scenes(&l.analysis.diffs, fc, &l.cuts.cuts, &self.params);
         if self.selected.is_some_and(|id| !l.scenes.iter().any(|s| s.id == id)) {
             self.selected = None;
         }
+        if self.selected_cut.is_some_and(|id| l.cuts.get(id).is_none()) {
+            self.selected_cut = None;
+        }
         self.sync_loop_range();
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty_since = Some(Instant::now());
+    }
+
+    fn save_project(&mut self) {
+        self.dirty_since = None;
+        let Some(path) = &self.video_path else { return };
+        if self.save_blocked {
+            return;
+        }
+        let project = Project { params: self.params.clone(), edits: self.edits.clone(), ..Project::default() };
+        if let Err(e) = project::save(path, &project) {
+            self.notify(format!("Couldn't save edits: {e:#}"));
+        }
+    }
+
+    /// Record an undo step, change the edits, and refresh.
+    fn edit(&mut self, coalesce_key: Option<String>, change: impl FnOnce(&mut Edits)) {
+        self.history.checkpoint(&self.edits, coalesce_key);
+        change(&mut self.edits);
+        self.recompute();
+        self.mark_dirty();
     }
 
     /// Keep the player's loop range on the selected scene's exported frames.
@@ -187,19 +294,47 @@ impl App {
     }
 
     fn effective_kind(&self, scene: &Scene) -> SceneKind {
-        self.kind_overrides.get(&scene.id).copied().unwrap_or(scene.kind)
+        self.edits.kinds.get(&scene.id).copied().unwrap_or(scene.kind)
     }
 
     fn will_export(&self, scene: &Scene) -> bool {
-        !scene.keep.is_empty() && !self.excluded.contains(&scene.id)
+        !scene.keep.is_empty() && !self.edits.excluded.contains(&scene.id)
+    }
+
+    /// Move a cut (no undo step), clamped between its neighbours, and preview the new first frame.
+    fn move_cut(&mut self, id: CutId, frame: usize) {
+        let Some(l) = &self.loaded else { return };
+        let Some(cut) = l.cuts.get(id).copied() else { return };
+        let range = l.cuts.movable_range(id, l.frame_count());
+        let frame = frame.clamp(range.start, range.end - 1);
+        if frame != cut.frame {
+            if cut.ghost == Some(frame) {
+                // Back at the detected position: it's no longer an edit.
+                self.edits.cuts.reset(id);
+            } else {
+                self.edits.cuts.set_frame(id, frame);
+            }
+            self.recompute();
+            self.mark_dirty();
+        }
+        if let Some(l) = &mut self.loaded {
+            l.player.pause();
+            l.player.seek(frame);
+        }
     }
 
     fn apply(&mut self, action: Action) {
+        let Some(l) = &mut self.loaded else { return };
+        let position = l.player.position();
         match action {
+            Action::Seek(frame) => l.player.seek(frame),
+            Action::Step(delta) => l.player.step(delta),
+            Action::TogglePlay => l.player.toggle(),
             Action::SelectScene { index, play } => {
-                let Some(scene) = self.loaded.as_ref().and_then(|l| l.scenes.get(index)) else { return };
+                let Some(scene) = l.scenes.get(index) else { return };
                 let (id, frame) = (scene.id, if scene.keep.is_empty() { scene.start } else { scene.keep.start });
                 self.selected = Some(id);
+                self.scroll_to_scene = Some(index);
                 self.sync_loop_range();
                 let player = &mut self.loaded.as_mut().unwrap().player;
                 player.seek(frame);
@@ -207,15 +342,94 @@ impl App {
                     player.play();
                 }
             }
-            other => {
-                let Some(l) = &mut self.loaded else { return };
-                match other {
-                    Action::Seek(frame) => l.player.seek(frame),
-                    Action::Step(delta) => l.player.step(delta),
-                    Action::TogglePlay => l.player.toggle(),
-                    Action::SelectScene { .. } => unreachable!(),
+            Action::SelectSceneAt { index, frame } => {
+                let Some(scene) = l.scenes.get(index) else { return };
+                self.selected = Some(scene.id);
+                self.scroll_to_scene = Some(index);
+                self.sync_loop_range();
+                self.loaded.as_mut().unwrap().player.seek(frame);
+            }
+            Action::SelectCut(id) => self.selected_cut = id,
+            Action::Checkpoint => self.history.checkpoint(&self.edits, None),
+            Action::MoveCut { id, frame } => self.move_cut(id, frame),
+            Action::Split => self.apply(Action::SplitAt(position)),
+            Action::SplitAt(frame) => {
+                if frame == 0 || frame >= l.frame_count() {
+                    self.notify("Can't split at the very start or end of the video.");
+                } else if l.cuts.cuts.iter().any(|c| c.frame == frame) {
+                    self.notify(format!("There's already a cut at frame {frame}."));
+                } else {
+                    let mut new_id = None;
+                    self.edit(None, |e| new_id = Some(e.cuts.add(frame)));
+                    self.selected_cut = new_id;
                 }
             }
+            Action::DeleteCut(id) => {
+                self.edit(None, |e| e.cuts.delete(id));
+                if self.selected_cut == Some(id) {
+                    self.selected_cut = None;
+                }
+            }
+            Action::DeleteSelected => match self.selected_cut {
+                Some(id) => self.apply(Action::DeleteCut(id)),
+                None => self.notify("Select a cut first: click its marker, or use [ and ] to jump to one."),
+            },
+            Action::ResetCut(id) => self.edit(None, |e| e.cuts.reset(id)),
+            Action::ResetAllCuts => self.edit(None, |e| {
+                e.cuts = CutEdits { next_manual_id: e.cuts.next_manual_id, ..CutEdits::default() };
+            }),
+            Action::Nudge(delta) => {
+                let target = self
+                    .selected_cut
+                    .and_then(|id| l.cuts.get(id))
+                    .or_else(|| l.cuts.cuts.iter().min_by_key(|c| c.frame.abs_diff(position)))
+                    .copied();
+                let Some(cut) = target else {
+                    self.notify("There are no cuts to nudge.");
+                    return;
+                };
+                self.selected_cut = Some(cut.id);
+                self.history.checkpoint(&self.edits, Some(format!("nudge {}", cut.id)));
+                self.move_cut(cut.id, cut.frame.saturating_add_signed(delta as isize).max(1));
+            }
+            Action::JumpCut(dir) => {
+                let target = if dir < 0 {
+                    l.cuts.cuts.iter().rev().find(|c| c.frame < position)
+                } else {
+                    l.cuts.cuts.iter().find(|c| c.frame > position)
+                };
+                if let Some(cut) = target.copied() {
+                    self.selected_cut = Some(cut.id);
+                    l.player.pause();
+                    l.player.seek(cut.frame);
+                }
+            }
+            Action::Undo | Action::Redo => {
+                let done = if matches!(action, Action::Undo) {
+                    self.history.undo(&mut self.edits)
+                } else {
+                    self.history.redo(&mut self.edits)
+                };
+                if done {
+                    self.recompute();
+                    self.mark_dirty();
+                }
+            }
+            Action::ZoomToSelectedScene => {
+                if let Some(s) = self.selected.and_then(|id| l.scenes.iter().find(|s| s.id == id)) {
+                    self.view.show_range(s.start..s.end);
+                }
+            }
+            Action::SetKind(id, kind) => self.edit(None, |e| {
+                e.kinds.insert(id, kind);
+            }),
+            Action::SetExcluded(id, excluded) => self.edit(None, |e| {
+                if excluded {
+                    e.excluded.insert(id);
+                } else {
+                    e.excluded.remove(&id);
+                }
+            }),
         }
     }
 
@@ -234,7 +448,7 @@ impl App {
             })
             .collect();
         if items.is_empty() {
-            self.status = "Nothing selected to export.".into();
+            self.notify("Nothing selected to export.");
             return;
         }
 
@@ -268,12 +482,18 @@ impl App {
                         Err(e) => self.status = format!("Analysis failed: {e:#}"),
                     }
                 }
-                Msg::Thumb { generation, frame, size, rgba } if generation == self.generation => {
-                    let image = ColorImage::from_rgba_unmultiplied(size, &rgba);
-                    let tex = ctx.load_texture(format!("thumb-{frame}"), image, TextureOptions::LINEAR);
-                    self.thumbs.insert(frame, tex);
+                Msg::Frames { generation, kind, start, size, frames } if generation == self.generation => {
+                    let cache = match kind {
+                        FrameKind::Thumb => &mut self.thumbs,
+                        FrameKind::Strip => &mut self.strip,
+                    };
+                    for (i, rgba) in frames.iter().enumerate() {
+                        let image = ColorImage::from_rgba_unmultiplied(size, rgba);
+                        let name = format!("{}-{}", if kind == FrameKind::Thumb { "thumb" } else { "strip" }, start + i);
+                        cache.insert(start + i, ctx.load_texture(name, image, TextureOptions::LINEAR));
+                    }
                 }
-                Msg::AnalysisDone { .. } | Msg::Thumb { .. } => {}
+                Msg::AnalysisDone { .. } | Msg::Frames { .. } => {}
                 Msg::ExportProgress(done) => {
                     if let Task::Exporting { total, .. } = self.task {
                         self.task = Task::Exporting { done, total };
@@ -281,10 +501,13 @@ impl App {
                 }
                 Msg::ExportDone(result) => {
                     self.task = Task::Idle;
-                    self.status = match result {
-                        Ok(files) => format!("Exported {} files.", files.len()),
-                        Err(e) => format!("Export failed: {e:#}"),
-                    };
+                    if let Some(l) = &self.loaded {
+                        self.status = format!("{}", l.path.file_name().unwrap_or_default().to_string_lossy());
+                    }
+                    match result {
+                        Ok(files) => self.notify(format!("Exported {} files.", files.len())),
+                        Err(e) => self.notify(format!("Export failed: {e:#}")),
+                    }
                 }
             }
         }
@@ -294,16 +517,45 @@ impl App {
         if self.loaded.is_none() || ctx.memory(|m| m.focused().is_some()) {
             return;
         }
-        let (space, left, right) =
-            ctx.input(|i| (i.key_pressed(Key::Space), i.key_pressed(Key::ArrowLeft), i.key_pressed(Key::ArrowRight)));
-        if space {
-            self.apply(Action::TogglePlay);
+        let keys: Vec<(Key, egui::Modifiers)> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (key, m) in keys {
+            let step = if m.shift { 10 } else { 1 };
+            let action = match key {
+                Key::Z if m.command && m.shift => Action::Redo,
+                Key::Z if m.command => Action::Undo,
+                Key::Y if m.command => Action::Redo,
+                _ if m.command || m.alt => continue,
+                Key::Space => Action::TogglePlay,
+                Key::ArrowLeft => Action::Step(-step),
+                Key::ArrowRight => Action::Step(step),
+                Key::S => Action::Split,
+                Key::Delete | Key::Backspace => Action::DeleteSelected,
+                Key::Comma => Action::Nudge(-step),
+                Key::Period => Action::Nudge(step),
+                Key::OpenBracket => Action::JumpCut(-1),
+                Key::CloseBracket => Action::JumpCut(1),
+                Key::Escape => Action::SelectCut(None),
+                _ => continue,
+            };
+            self.apply(action);
         }
-        if left {
-            self.apply(Action::Step(-1));
-        }
-        if right {
-            self.apply(Action::Step(1));
+    }
+
+    /// Ask the frame worker for any filmstrip frames in `window` it hasn't been asked for yet.
+    fn request_strip_frames(&mut self, window: std::ops::Range<usize>) {
+        let Some(l) = &self.loaded else { return };
+        let missing: Vec<usize> = window.filter(|f| !self.strip.contains_key(f) && !self.strip_requested.contains(f)).collect();
+        if let (Some(&first), Some(&last)) = (missing.first(), missing.last()) {
+            self.strip_requested.extend(first..=last);
+            let _ = l.frame_tx.send(FrameJob { kind: FrameKind::Strip, start: first, count: last - first + 1 });
         }
     }
 
@@ -340,10 +592,16 @@ impl App {
                 Task::Idle => {}
             }
             ui.label(&self.status);
+            if let Some((text, at)) = &self.notice {
+                if at.elapsed() < NOTICE_DURATION {
+                    ui.label(RichText::new(text).color(ui.visuals().warn_fg_color));
+                    ui.ctx().request_repaint_after(NOTICE_DURATION);
+                }
+            }
         });
     }
 
-    fn settings(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+    fn settings(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         let p = &mut self.params;
         ui.horizontal(|ui| {
@@ -379,9 +637,10 @@ impl App {
             ui.end_row();
 
             ui.label("Cut offset (frames)").on_hover_text(
-                "Moves every cut relative to the detected change.\n\
+                "Moves every detected cut relative to the detected change.\n\
                  0: the new scene starts on the first changed frame.\n\
-                 Negative: earlier. Positive: later.",
+                 Negative: earlier. Positive: later.\n\
+                 Cuts you moved or added by hand aren't affected.",
             );
             changed |= ui.add(egui::DragValue::new(&mut p.cut_offset).range(-60..=60).speed(0.1)).changed();
             ui.label("Drop frames before / after cut").on_hover_text(
@@ -397,24 +656,49 @@ impl App {
         });
         if changed {
             self.recompute();
+            self.mark_dirty();
         }
+    }
 
-        let l = self.loaded.as_ref()?;
-        let action = difference_graph(ui, l, &self.params, &self.merged).map(Action::Seek);
+    fn cut_editor(&mut self, ui: &mut egui::Ui) -> Vec<Action> {
+        let Some(l) = &self.loaded else { return Vec::new() };
+        let input = editor::GraphInput {
+            diffs: &l.analysis.diffs,
+            cuts: &l.cuts,
+            frame_count: l.frame_count(),
+            fps: l.analysis.fps,
+            playhead: l.player.position(),
+            selected_cut: self.selected_cut,
+            threshold: match self.params.mode {
+                DetectMode::Fixed => self.params.cut_threshold,
+                DetectMode::Adaptive => self.params.adaptive_floor,
+            },
+        };
+        let mut actions = editor::graph(ui, &mut self.view, &input);
+
+        let toolbar = editor::ToolbarInput {
+            selected_cut: self.selected_cut.and_then(|id| l.cuts.get(id)).copied(),
+            has_selected_scene: self.selected.is_some(),
+            has_cut_edits: !self.edits.cuts.is_empty(),
+            can_undo: self.history.can_undo(),
+            can_redo: self.history.can_redo(),
+        };
+        actions.extend(editor::toolbar(ui, &mut self.view, &toolbar));
+
         let n = l.scenes.len();
         let stills = l.scenes.iter().filter(|s| self.effective_kind(s) == SceneKind::Still).count();
         let empty = l.scenes.iter().filter(|s| s.keep.is_empty()).count();
+        let edited = l.cuts.cuts.iter().filter(|c| c.source != CutSource::Detected).count() + l.cuts.removed.len();
         ui.horizontal(|ui| {
             ui.label(format!("{n} scenes · {stills} stills · {} clips", n - stills));
+            if edited > 0 {
+                ui.label(RichText::new(format!("· {edited} cut edits")).weak());
+            }
             if empty > 0 {
                 ui.label(RichText::new(format!("· {empty} trimmed to nothing")).color(ui.visuals().warn_fg_color));
             }
-            if !self.merged.is_empty() && ui.button(format!("Undo {} merges", self.merged.len())).clicked() {
-                self.merged.clear();
-                self.recompute();
-            }
         });
-        action
+        actions
     }
 
     fn export_bar(&mut self, ui: &mut egui::Ui) {
@@ -441,12 +725,12 @@ impl App {
         });
     }
 
-    fn player_panel(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+    fn player_panel(&mut self, ui: &mut egui::Ui) -> Vec<Action> {
         let Some(l) = &self.loaded else {
             ui.centered_and_justified(|ui| ui.label(RichText::new("No video loaded").weak()));
-            return None;
+            return Vec::new();
         };
-        let mut action = None;
+        let mut actions = Vec::new();
         let player = &l.player;
 
         let size = vec2(ui.available_width(), ui.available_width() / player.aspect());
@@ -454,7 +738,7 @@ impl App {
             Some(tex) => {
                 let resp = ui.add(egui::Image::from_texture((tex.id(), size)).sense(Sense::click()));
                 if resp.clicked() {
-                    action = Some(Action::TogglePlay);
+                    actions.push(Action::TogglePlay);
                 }
             }
             None => {
@@ -464,9 +748,7 @@ impl App {
             }
         }
 
-        if let Some(frame) = timeline(ui, l, self.selected) {
-            action = Some(Action::Seek(frame));
-        }
+        actions.extend(timeline(ui, l, &self.edits, self.selected, &self.view));
 
         let current = player.current_frame();
         let here = l.scene_at(current);
@@ -475,20 +757,20 @@ impl App {
                 // Restart the current scene unless we're already at its beginning.
                 let at_start = l.scenes.get(here).is_none_or(|s| current <= s.keep.start + 2);
                 let index = if at_start { here.saturating_sub(1) } else { here };
-                action = Some(Action::SelectScene { index, play: player.is_playing() });
+                actions.push(Action::SelectScene { index, play: player.is_playing() });
             }
             if ui.button("◀").on_hover_text("Previous frame (←)").clicked() {
-                action = Some(Action::Step(-1));
+                actions.push(Action::Step(-1));
             }
             let play_label = if player.is_playing() { "⏸" } else { "▶" };
             if ui.button(play_label).on_hover_text("Play / pause (Space)").clicked() {
-                action = Some(Action::TogglePlay);
+                actions.push(Action::TogglePlay);
             }
             if ui.button("▶|").on_hover_text("Next frame (→)").clicked() {
-                action = Some(Action::Step(1));
+                actions.push(Action::Step(1));
             }
             if ui.button("⏭").on_hover_text("Next scene").clicked() && here + 1 < l.scenes.len() {
-                action = Some(Action::SelectScene { index: here + 1, play: player.is_playing() });
+                actions.push(Action::SelectScene { index: here + 1, play: player.is_playing() });
             }
             ui.monospace(format!(
                 "{} / {}  #{current}",
@@ -503,31 +785,57 @@ impl App {
         {
             self.sync_loop_range();
         }
-        action
+        actions
     }
 
-    fn scene_list(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+    fn filmstrip(&mut self, ui: &mut egui::Ui) -> Vec<Action> {
+        let Some(l) = &self.loaded else { return Vec::new() };
+        let Some(cut) = self.selected_cut.and_then(|id| l.cuts.get(id)).copied() else { return Vec::new() };
+        let input = editor::StripInput {
+            cut,
+            frame_count: l.frame_count(),
+            fps: l.analysis.fps,
+            movable: l.cuts.movable_range(cut.id, l.frame_count()),
+            frames: &self.strip,
+            aspect: l.player.aspect(),
+        };
+        let (actions, window) = editor::filmstrip(ui, &input);
+        ui.separator();
+        self.request_strip_frames(window);
+        actions
+    }
+
+    fn scene_list(&mut self, ui: &mut egui::Ui) -> Vec<Action> {
         let Some(l) = &self.loaded else {
             ui.centered_and_justified(|ui| ui.label(RichText::new("No video loaded").weak()));
-            return None;
+            return Vec::new();
         };
-        let thumb_h = thumb_height(&l.info);
+        let thumb_h = scaled_height(&l.info, THUMB_W).min(ROW_SEPARATOR_AT as u32);
         let n = l.scenes.len();
-        let mut action = None;
-        let mut merge_at = None;
+        let mut actions = Vec::new();
 
-        egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_HEIGHT, n, |ui, range| {
+        // Every row is exactly ROW_HEIGHT tall (its separator included), so a row's scroll
+        // offset is exact and selecting a scene elsewhere can bring it into view.
+        let pitch = ROW_HEIGHT + ui.spacing().item_spacing.y;
+        let mut area = egui::ScrollArea::vertical().auto_shrink(false);
+        if let Some(i) = self.scroll_to_scene.take().filter(|i| !self.visible_rows.contains(i)) {
+            area = area.vertical_scroll_offset((i as f32 - 1.0).max(0.0) * pitch);
+        }
+        let mut visible = 0..0;
+        area.show_rows(ui, ROW_HEIGHT, n, |ui, range| {
+            // `range` includes partly visible rows at either end.
+            visible = range.start + 1..range.end.saturating_sub(1);
             for i in range {
                 let scene = &l.scenes[i];
                 let thumb_frame = scene.middle();
                 if self.thumbs_requested.insert(thumb_frame) {
-                    let _ = l.thumb_tx.send(thumb_frame);
+                    let _ = l.frame_tx.send(FrameJob { kind: FrameKind::Thumb, start: thumb_frame, count: 1 });
                 }
                 let is_selected = self.selected == Some(scene.id);
                 let background = ui.painter().add(Shape::Noop);
 
                 let row = ui.horizontal(|ui| {
-                    ui.set_height(ROW_HEIGHT);
+                    ui.set_height(ROW_SEPARATOR_AT);
                     let size = vec2(THUMB_W as f32, thumb_h as f32);
                     let thumb = match self.thumbs.get(&thumb_frame) {
                         Some(tex) => ui.add(egui::Image::from_texture((tex.id(), size)).sense(Sense::click())),
@@ -539,7 +847,7 @@ impl App {
                         }
                     };
                     if thumb.on_hover_text("Click to preview").clicked() {
-                        action = Some(Action::SelectScene { index: i, play: true });
+                        actions.push(Action::SelectScene { index: i, play: true });
                     }
 
                     ui.vertical(|ui| {
@@ -551,6 +859,15 @@ impl App {
                                 let (start, end) =
                                     (l.analysis.frame_time(scene.keep.start), l.analysis.frame_time(scene.keep.end));
                                 ui.label(format!("{} – {}  ({:.1}s)", fmt_time(start), fmt_time(end), end - start));
+                            }
+                            match l.cuts.get(scene.id).map(|c| c.source) {
+                                Some(CutSource::Moved) => {
+                                    ui.label(RichText::new("✎ moved cut").small().color(editor::MOVED_COLOR));
+                                }
+                                Some(CutSource::Manual) => {
+                                    ui.label(RichText::new("✂ manual cut").small().color(editor::MANUAL_COLOR));
+                                }
+                                _ => {}
                             }
                         });
                         ui.label(
@@ -564,27 +881,24 @@ impl App {
                         );
 
                         ui.horizontal(|ui| {
-                            let mut include = !self.excluded.contains(&scene.id);
+                            let mut include = !self.edits.excluded.contains(&scene.id);
                             let checkbox = ui.add_enabled(!scene.keep.is_empty(), egui::Checkbox::new(&mut include, "Export"));
                             if checkbox.changed() {
-                                if include {
-                                    self.excluded.remove(&scene.id);
-                                } else {
-                                    self.excluded.insert(scene.id);
-                                }
+                                actions.push(Action::SetExcluded(scene.id, !include));
                             }
-                            let mut kind = self.kind_overrides.get(&scene.id).copied().unwrap_or(scene.kind);
-                            let before = kind;
+                            // Field access rather than `effective_kind` keeps this closure's borrows disjoint.
+                            let current = self.edits.kinds.get(&scene.id).copied().unwrap_or(scene.kind);
+                            let mut kind = current;
                             ui.selectable_value(&mut kind, SceneKind::Video, "🎞 Video");
                             ui.selectable_value(&mut kind, SceneKind::Still, "🖼 Still");
-                            if kind != before {
-                                self.kind_overrides.insert(scene.id, kind);
+                            if kind != current {
+                                actions.push(Action::SetKind(scene.id, kind));
                             }
                             if ui.button("▶ Preview").clicked() {
-                                action = Some(Action::SelectScene { index: i, play: true });
+                                actions.push(Action::SelectScene { index: i, play: true });
                             }
-                            if i + 1 < n && ui.button("Merge with next").clicked() {
-                                merge_at = Some(l.scenes[i + 1].id);
+                            if i + 1 < n && ui.button("Merge with next").on_hover_text("Delete the cut between this scene and the next").clicked() {
+                                actions.push(Action::DeleteCut(l.scenes[i + 1].id));
                             }
                         });
                     });
@@ -595,15 +909,14 @@ impl App {
                     let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.35);
                     ui.painter().set(background, Shape::rect_filled(rect, 4.0, fill));
                 }
-                ui.separator();
+                // The rest of the row's height, with the separator line in it.
+                let rest = ROW_HEIGHT - ROW_SEPARATOR_AT - ui.spacing().item_spacing.y;
+                let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), rest), Sense::hover());
+                ui.painter().hline(line.x_range(), line.center().y, ui.visuals().widgets.noninteractive.bg_stroke);
             }
         });
-
-        if let Some(cut) = merge_at {
-            self.merged.insert(cut);
-            self.recompute();
-        }
-        action
+        self.visible_rows = visible;
+        actions
     }
 }
 
@@ -620,6 +933,14 @@ impl eframe::App for App {
         if let Some(l) = &mut self.loaded {
             l.player.tick(ctx);
         }
+        if let Some(since) = self.dirty_since {
+            let wait = SAVE_DELAY.saturating_sub(since.elapsed());
+            if wait.is_zero() {
+                self.save_project();
+            } else {
+                ctx.request_repaint_after(wait);
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -631,7 +952,8 @@ impl eframe::App for App {
         });
         egui::Panel::top("settings").show(ui, |ui| {
             ui.add_space(4.0);
-            actions.extend(self.settings(ui));
+            self.settings(ui);
+            actions.extend(self.cut_editor(ui));
             ui.add_space(4.0);
         });
         egui::Panel::bottom("export").show(ui, |ui| {
@@ -643,119 +965,97 @@ impl eframe::App for App {
             ui.add_space(4.0);
             actions.extend(self.player_panel(ui));
         });
-        egui::CentralPanel::default().show(ui, |ui| actions.extend(self.scene_list(ui)));
+        egui::CentralPanel::default().show(ui, |ui| {
+            actions.extend(self.filmstrip(ui));
+            actions.extend(self.scene_list(ui));
+        });
 
         for action in actions {
             self.apply(action);
         }
     }
+
+    fn on_exit(&mut self) {
+        if self.dirty_since.is_some() {
+            self.save_project();
+        }
+    }
 }
 
-/// Plot of the per-frame difference, with cut markers and the active threshold.
-/// Returns a frame to seek to when clicked or dragged.
-fn difference_graph(ui: &mut egui::Ui, l: &Loaded, params: &Params, merged: &HashSet<usize>) -> Option<usize> {
-    let diffs = &l.analysis.diffs;
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 70.0), Sense::click_and_drag());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-    if diffs.is_empty() {
-        return None;
-    }
-
-    let y_max = diffs.iter().copied().fold(0.0f32, f32::max).clamp(10.0, 120.0);
-    let to_y = |v: f32| rect.bottom() - (v / y_max).min(1.0) * rect.height();
-    let to_x = |frame: usize| rect.left() + frame as f32 / diffs.len() as f32 * rect.width();
-
-    // One bar per pixel column, showing the largest difference in that column.
-    let cols = rect.width().max(1.0) as usize;
-    let line = Stroke::new(1.0, ui.visuals().text_color().gamma_multiply(0.6));
-    for c in 0..cols {
-        let lo = c * diffs.len() / cols;
-        let hi = ((c + 1) * diffs.len() / cols).max(lo + 1).min(diffs.len());
-        let v = diffs[lo..hi].iter().copied().fold(0.0f32, f32::max);
-        let x = rect.left() + c as f32 + 0.5;
-        painter.vline(x, to_y(v)..=rect.bottom(), line);
-    }
-
-    for &cut in merged {
-        painter.vline(to_x(cut), rect.y_range(), Stroke::new(1.0, Color32::GRAY.gamma_multiply(0.7)));
-    }
-    for scene in l.scenes.iter().skip(1) {
-        painter.vline(to_x(scene.start), rect.y_range(), Stroke::new(1.0, ACCENT.gamma_multiply(0.7)));
-    }
-    let threshold = match params.mode {
-        DetectMode::Fixed => params.cut_threshold,
-        DetectMode::Adaptive => params.adaptive_floor,
-    };
-    painter.hline(rect.x_range(), to_y(threshold), Stroke::new(1.0, VIDEO_COLOR));
-    painter.vline(to_x(l.player.current_frame()), rect.y_range(), Stroke::new(1.5, ui.visuals().strong_text_color()));
-
-    let frame_at = |x: f32| ((((x - rect.left()) / rect.width()) * diffs.len() as f32) as usize).min(diffs.len() - 1);
-    if let Some(pos) = response.hover_pos() {
-        let frame = frame_at(pos.x);
-        painter.vline(pos.x, rect.y_range(), Stroke::new(1.0, ui.visuals().weak_text_color()));
-        painter.text(
-            pos2(pos.x + 4.0, rect.top() + 2.0),
-            egui::Align2::LEFT_TOP,
-            format!("{}  diff {:.1}", fmt_time(l.analysis.frame_time(frame)), diffs[frame]),
-            egui::FontId::monospace(11.0),
-            ui.visuals().strong_text_color(),
-        );
-    }
-    seek_target(&response, l, frame_at)
-}
-
-/// Scrubbable bar showing every scene's exported frames (blue = clip, green = still),
-/// trimmed gaps, the selected scene, and the playhead.
-fn timeline(ui: &mut egui::Ui, l: &Loaded, selected: Option<usize>) -> Option<usize> {
+/// Overview of the whole video: every scene's exported frames (blue = clip, green = still,
+/// faded = not exported), the selected scene, the graph's zoom window, and the playhead.
+/// Click a clip to select it (the playhead moves to the click); drag to scrub.
+fn timeline(ui: &mut egui::Ui, l: &Loaded, edits: &Edits, selected: Option<CutId>, view: &EditorView) -> Option<Action> {
     let total = l.player.frame_count().max(1);
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-    let to_x = |frame: usize| rect.left() + frame as f32 / total as f32 * rect.width();
+    let to_x = |frame: f64| rect.left() + (frame / total as f64) as f32 * rect.width();
+    let frame_at = |x: f32| ((((x - rect.left()) / rect.width()) * total as f32).max(0.0) as usize).min(total - 1);
+    let hovered = response.hover_pos().map(|p| l.scene_at(frame_at(p.x)));
 
-    for scene in &l.scenes {
-        if scene.keep.is_empty() {
-            continue;
+    for (i, scene) in l.scenes.iter().enumerate() {
+        let full = Rect::from_x_y_ranges(to_x(scene.start as f64)..=to_x(scene.end as f64), rect.y_range());
+        if hovered == Some(i) {
+            painter.rect_filled(full, 1.0, ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.5));
         }
-        let color = match scene.kind {
-            SceneKind::Video => VIDEO_COLOR,
-            SceneKind::Still => STILL_COLOR,
-        };
-        let r = Rect::from_x_y_ranges(to_x(scene.keep.start)..=to_x(scene.keep.end), rect.y_range()).shrink2(vec2(0.5, 3.0));
-        painter.rect_filled(r, 1.0, color.gamma_multiply(0.6));
+        if !scene.keep.is_empty() {
+            let color = match edits.kinds.get(&scene.id).copied().unwrap_or(scene.kind) {
+                SceneKind::Video => VIDEO_COLOR,
+                SceneKind::Still => STILL_COLOR,
+            };
+            let alpha = if edits.excluded.contains(&scene.id) { 0.2 } else { 0.6 };
+            let r = Rect::from_x_y_ranges(to_x(scene.keep.start as f64)..=to_x(scene.keep.end as f64), rect.y_range())
+                .shrink2(vec2(0.5, 3.0));
+            painter.rect_filled(r, 1.0, color.gamma_multiply(alpha));
+        }
         if selected == Some(scene.id) {
-            painter.rect_stroke(r.expand(2.0), 2.0, Stroke::new(1.5, ACCENT), egui::StrokeKind::Outside);
+            let r = full.shrink2(vec2(0.5, 1.0));
+            painter.rect_stroke(r, 2.0, Stroke::new(2.0, editor::DETECTED_COLOR), egui::StrokeKind::Inside);
         }
     }
-    let x = to_x(l.player.current_frame());
+    if view.is_zoomed() {
+        let r = Rect::from_x_y_ranges(to_x(view.start)..=to_x(view.end), rect.y_range());
+        let stroke = Stroke::new(1.0, ui.visuals().strong_text_color().gamma_multiply(0.7));
+        painter.rect_stroke(r, 1.0, stroke, egui::StrokeKind::Inside);
+    }
+    let x = to_x(l.player.current_frame() as f64);
     painter.vline(x, rect.y_range(), Stroke::new(2.0, ui.visuals().strong_text_color()));
 
-    let frame_at = |x: f32| ((((x - rect.left()) / rect.width()) * total as f32) as usize).min(total - 1);
-    seek_target(&response, l, frame_at)
-}
+    let response = match hovered.and_then(|i| l.scenes.get(i).map(|s| (i, s))) {
+        Some((i, s)) if !response.dragged() => response.on_hover_text(format!(
+            "Scene #{}  {} – {}\nClick to select, drag to scrub",
+            i + 1,
+            fmt_time(l.analysis.frame_time(s.start)),
+            fmt_time(l.analysis.frame_time(s.end)),
+        )),
+        _ => response,
+    };
 
-fn seek_target(response: &egui::Response, l: &Loaded, frame_at: impl Fn(f32) -> usize) -> Option<usize> {
-    if !(response.clicked() || response.dragged()) {
-        return None;
-    }
     let frame = frame_at(response.interact_pointer_pos()?.x);
-    // Avoid restarting the decoder every UI frame while the mouse is held still.
-    (frame != l.player.current_frame()).then_some(frame)
+    if response.clicked() {
+        Some(Action::SelectSceneAt { index: l.scene_at(frame), frame })
+    } else if response.dragged() && frame != l.player.position() {
+        // Only seek when the frame changes, so holding still doesn't restart the decoder.
+        Some(Action::Seek(frame))
+    } else {
+        None
+    }
 }
 
-/// Background thread that decodes thumbnails on request. Exits when the sender is dropped
-/// (i.e. when another video is opened).
-fn spawn_thumb_worker(
+/// Background thread that decodes thumbnails and filmstrip frames on request. Exits when the
+/// sender is dropped (i.e. when another video is opened).
+fn spawn_frame_worker(
     ctx: egui::Context,
     tx: Sender<Msg>,
     generation: u64,
     path: PathBuf,
     info: &VideoInfo,
     fps: f64,
-) -> Sender<usize> {
-    let (req_tx, req_rx) = channel::<usize>();
-    let h = thumb_height(info);
+) -> Sender<FrameJob> {
+    let (req_tx, req_rx) = channel::<FrameJob>();
+    let thumb = (THUMB_W, scaled_height(info, THUMB_W).min(ROW_SEPARATOR_AT as u32));
+    let strip = (STRIP_W, scaled_height(info, STRIP_W));
     std::thread::spawn(move || {
         let mut queue = Vec::new();
         while let Ok(first) = req_rx.recv() {
@@ -763,29 +1063,26 @@ fn spawn_thumb_worker(
             // Serve the most recent requests first: they're what's on screen now.
             loop {
                 queue.extend(req_rx.try_iter());
-                let Some(frame) = queue.pop() else { break };
-                match ffmpeg::grab_frame_rgba(&path, frame as f64 / fps, THUMB_W, h) {
-                    Ok(rgba) => {
-                        let msg = Msg::Thumb { generation, frame, size: [THUMB_W as usize, h as usize], rgba };
-                        if tx.send(msg).is_err() {
-                            return;
-                        }
-                        ctx.request_repaint();
-                    }
-                    Err(_) => continue,
+                let Some(job) = queue.pop() else { break };
+                let (w, h) = if job.kind == FrameKind::Thumb { thumb } else { strip };
+                let Ok(frames) = ffmpeg::grab_frames_rgba(&path, job.start, job.count, fps, w, h) else { continue };
+                let msg = Msg::Frames { generation, kind: job.kind, start: job.start, size: [w as usize, h as usize], frames };
+                if tx.send(msg).is_err() {
+                    return;
                 }
+                ctx.request_repaint();
             }
         }
     });
     req_tx
 }
 
-fn thumb_height(info: &VideoInfo) -> u32 {
-    if info.width == 0 {
-        return THUMB_W * 9 / 16;
+/// Height for `width` that keeps the video's aspect ratio; even, which keeps ffmpeg's scaler happy.
+fn scaled_height(info: &VideoInfo, width: u32) -> u32 {
+    if info.width == 0 || info.height == 0 {
+        return width * 9 / 16 / 2 * 2;
     }
-    // Even number, which keeps ffmpeg's scaler happy.
-    ((THUMB_W as f64 * info.height as f64 / info.width as f64).round() as u32 / 2 * 2).clamp(2, ROW_HEIGHT as u32 - 4)
+    ((width as f64 * info.height as f64 / info.width as f64).round() as u32 / 2 * 2).max(2)
 }
 
 fn default_out_dir(input: &Path) -> PathBuf {
@@ -793,8 +1090,95 @@ fn default_out_dir(input: &Path) -> PathBuf {
     input.parent().unwrap_or(Path::new(".")).join(format!("{stem}_scenes"))
 }
 
-fn fmt_time(secs: f64) -> String {
-    let secs = secs.max(0.0);
-    let m = (secs / 60.0).floor() as u64;
-    format!("{m}:{:04.1}", secs - m as f64 * 60.0)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cut_frames(app: &App) -> Vec<(usize, CutSource)> {
+        app.loaded.as_ref().unwrap().cuts.cuts.iter().map(|c| (c.frame, c.source)).collect()
+    }
+
+    fn position(app: &App) -> usize {
+        app.loaded.as_ref().unwrap().player.position()
+    }
+
+    /// Drives the editing actions against a real (synthetic) video: cuts detected at 75 and 150.
+    #[test]
+    #[ignore = "needs ffmpeg on PATH"]
+    fn cut_editing_end_to_end() {
+        let input = ffmpeg::make_test_video("app");
+        let ctx = egui::Context::default();
+        let mut app = App::empty();
+        app.open(&ctx, input.clone());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.loaded.is_none() {
+            assert!(Instant::now() < deadline, "analysis timed out: {}", app.status);
+            app.handle_messages(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cut_frames(&app), [(75, CutSource::Detected), (150, CutSource::Detected)]);
+
+        // Jump to the next cut from the start, nudge it twice (one undo step), then back.
+        app.apply(Action::JumpCut(1));
+        assert_eq!(app.selected_cut, Some(CutId::Detected(75)));
+        assert_eq!(position(&app), 75);
+        app.apply(Action::Nudge(1));
+        app.apply(Action::Nudge(1));
+        assert_eq!(cut_frames(&app)[0], (77, CutSource::Moved));
+        assert_eq!(position(&app), 77, "player previews the new first frame");
+        app.apply(Action::Nudge(-2));
+        assert_eq!(cut_frames(&app)[0], (75, CutSource::Detected), "back on the detected frame = not an edit");
+        app.apply(Action::Undo);
+        assert_eq!(cut_frames(&app)[0], (75, CutSource::Detected), "all three nudges were one undo step");
+
+        // A drag: one checkpoint, many moves, one undo step. Can't cross the neighbouring cut.
+        app.apply(Action::Checkpoint);
+        for frame in [90, 120, 400] {
+            app.apply(Action::MoveCut { id: CutId::Detected(75), frame });
+        }
+        assert_eq!(cut_frames(&app)[0].0, 149);
+        app.apply(Action::Undo);
+        assert_eq!(cut_frames(&app)[0], (75, CutSource::Detected));
+
+        // Split at the playhead, refuse a duplicate, then delete the new cut.
+        app.apply(Action::Seek(100));
+        app.apply(Action::Split);
+        assert_eq!(cut_frames(&app), [(75, CutSource::Detected), (100, CutSource::Manual), (150, CutSource::Detected)]);
+        let manual = app.selected_cut.unwrap();
+        app.apply(Action::SplitAt(100));
+        assert_eq!(cut_frames(&app).len(), 3);
+        assert!(app.notice.is_some());
+        app.apply(Action::DeleteSelected);
+        assert_eq!(cut_frames(&app).len(), 2);
+        assert_eq!(app.selected_cut, None);
+        app.apply(Action::Undo);
+        assert!(app.loaded.as_ref().unwrap().cuts.get(manual).is_some());
+        app.apply(Action::Redo);
+        assert_eq!(cut_frames(&app).len(), 2);
+
+        // Offset only shifts detected cuts; manual cuts stay put.
+        app.apply(Action::SplitAt(100));
+        app.params.cut_offset = 2;
+        app.recompute();
+        assert_eq!(cut_frames(&app), [(77, CutSource::Detected), (100, CutSource::Manual), (152, CutSource::Detected)]);
+
+        // Selecting from the timeline picks the clip under the click and seeks to that frame.
+        let index = app.loaded.as_ref().unwrap().scene_at(120);
+        app.apply(Action::SelectSceneAt { index, frame: 120 });
+        let scene = app.loaded.as_ref().unwrap().scenes[index].clone();
+        assert!((scene.start..scene.end).contains(&120));
+        assert_eq!(app.selected, Some(scene.id));
+        assert_eq!(position(&app), 120);
+        assert_eq!(app.scroll_to_scene, Some(index));
+
+        // Edits are saved next to the video and restored on reopen.
+        app.save_project();
+        let saved = project::load(&input).unwrap().expect("sidecar written");
+        assert_eq!(saved.params.cut_offset, 2);
+        assert_eq!(saved.edits, app.edits);
+        let mut reopened = App::empty();
+        reopened.open(&ctx, input.clone());
+        assert_eq!(reopened.edits, app.edits);
+        assert_eq!(reopened.params, app.params);
+    }
 }

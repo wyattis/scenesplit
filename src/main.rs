@@ -3,9 +3,11 @@
 
 mod analysis;
 mod app;
+mod editor;
 mod export;
 mod ffmpeg;
 mod player;
+mod project;
 mod scenes;
 
 fn main() -> eframe::Result {

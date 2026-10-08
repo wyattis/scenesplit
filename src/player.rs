@@ -76,6 +76,12 @@ impl Player {
         self.shown
     }
 
+    /// The frame the player is at or heading to: unlike [`Self::current_frame`], this is
+    /// already updated right after a seek, before the new frame has been decoded.
+    pub fn position(&self) -> usize {
+        if self.is_playing() { self.shown } else { self.paused_at }
+    }
+
     pub fn is_playing(&self) -> bool {
         self.clock.is_some()
     }

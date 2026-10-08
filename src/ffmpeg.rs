@@ -100,24 +100,30 @@ pub fn probe(path: &Path) -> Result<VideoInfo> {
     })
 }
 
-/// Grab a single RGBA frame at `time` seconds, scaled to `width` x `height`.
-pub fn grab_frame_rgba(path: &Path, time: f64, width: u32, height: u32) -> Result<Vec<u8>> {
+/// Grab `count` consecutive RGBA frames starting at frame `start` (at `fps`, matching the
+/// analysis frame numbering), scaled to `width` x `height`. Returns fewer frames if the
+/// video ends first.
+pub fn grab_frames_rgba(path: &Path, start: usize, count: usize, fps: f64, width: u32, height: u32) -> Result<Vec<Vec<u8>>> {
+    let time = start as f64 / fps;
     let mut child = command("ffmpeg")
-        .args(["-v", "error", "-ss", &format!("{time:.3}"), "-i"])
+        .args(["-v", "error", "-ss", &format!("{time:.4}"), "-i"])
         .arg(path)
-        .args(["-frames:v", "1", "-vf", &format!("scale={width}:{height}")])
+        .args(["-an", "-frames:v", &count.to_string()])
+        .args(["-vf", &format!("fps={fps},scale={width}:{height}")])
         .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .context("failed to run ffmpeg")?;
-    let mut buf = Vec::with_capacity((width * height * 4) as usize);
+    let mut buf = Vec::new();
     child.stdout.take().unwrap().read_to_end(&mut buf)?;
     child.wait()?;
-    if buf.len() != (width * height * 4) as usize {
-        bail!("could not decode frame at {time:.2}s");
+    let frame_len = (width * height * 4) as usize;
+    let frames: Vec<Vec<u8>> = buf.chunks_exact(frame_len).map(<[u8]>::to_vec).collect();
+    if frames.is_empty() {
+        bail!("could not decode frame {start}");
     }
-    Ok(buf)
+    Ok(frames)
 }
 
 /// Generates a 9 second, 25 fps test video: 3s moving pattern, 3s solid colour, 3s moving fractal.
@@ -139,4 +145,27 @@ pub fn make_test_video(name: &str) -> std::path::PathBuf {
         .unwrap();
     assert!(status.success());
     input
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The filmstrip relies on frame N from `grab_frames_rgba` being frame N of the analysis.
+    #[test]
+    #[ignore = "needs ffmpeg on PATH"]
+    fn grabbed_frames_line_up_with_analysis_numbering() {
+        let input = make_test_video("grab");
+        let info = probe(&input).unwrap();
+        // The solid-colour section starts exactly at frame 75 (3s at 25fps).
+        let frames = grab_frames_rgba(&input, 70, 10, info.fps, 64, 36).unwrap();
+        assert_eq!(frames.len(), 10);
+        let is_solid = |rgba: &[u8]| rgba.chunks(4).all(|p| p.iter().zip(&rgba[..4]).all(|(a, b)| a.abs_diff(*b) <= 3));
+        let solid: Vec<bool> = frames.iter().map(|f| is_solid(f)).collect();
+        assert_eq!(solid, [false, false, false, false, false, true, true, true, true, true]);
+
+        // Asking past the end returns what exists rather than failing.
+        let tail = grab_frames_rgba(&input, 220, 13, info.fps, 64, 36).unwrap();
+        assert_eq!(tail.len(), 5);
+    }
 }
