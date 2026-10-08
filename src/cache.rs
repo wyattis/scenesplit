@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 
 use crate::analysis::{ANALYSIS_VERSION, Analysis};
 
-const MAGIC: &[u8; 8] = b"SSPLITA1";
+const MAGIC: &[u8; 8] = b"SSPLITA2";
 /// Oldest entries beyond this many are deleted when saving.
 const MAX_ENTRIES: usize = 200;
 
@@ -62,24 +62,29 @@ fn entry_path(dir: &Path, key: &str) -> PathBuf {
     dir.join(format!("{hash:016x}.bin"))
 }
 
-/// Layout: magic, key length (u32) + key, fps (f64), diff count (u64), diffs (f32). Little-endian.
-fn encode(analysis: &Analysis, key: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + key.len() + analysis.diffs.len() * 4);
+/// Layout: magic, key length (u32) + key, fps (f64), frame count n (u64), then per frame:
+/// diffs (n - 1 f32), luma, sharpness (n f32 each), colour (n × 3 u8), hash (n u64).
+/// Little-endian.
+fn encode(a: &Analysis, key: &str) -> Vec<u8> {
+    let n = a.luma.len();
+    let mut out = Vec::with_capacity(32 + key.len() + n * 27);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&(key.len() as u32).to_le_bytes());
     out.extend_from_slice(key.as_bytes());
-    out.extend_from_slice(&analysis.fps.to_le_bytes());
-    out.extend_from_slice(&(analysis.diffs.len() as u64).to_le_bytes());
-    for d in &analysis.diffs {
-        out.extend_from_slice(&d.to_le_bytes());
+    out.extend_from_slice(&a.fps.to_le_bytes());
+    out.extend_from_slice(&(n as u64).to_le_bytes());
+    for series in [&a.diffs, &a.luma, &a.sharpness] {
+        series.iter().for_each(|v| out.extend_from_slice(&v.to_le_bytes()));
     }
+    a.color.iter().for_each(|c| out.extend_from_slice(c));
+    a.hash.iter().for_each(|h| out.extend_from_slice(&h.to_le_bytes()));
     out
 }
 
 fn decode(bytes: &[u8], expected_key: &str) -> Option<Analysis> {
     let mut rest = bytes.strip_prefix(MAGIC)?;
-    let mut take = |n: usize| -> Option<&[u8]> {
-        let (head, tail) = rest.split_at_checked(n)?;
+    let mut take = |len: usize| -> Option<&[u8]> {
+        let (head, tail) = rest.split_at_checked(len)?;
         rest = tail;
         Some(head)
     };
@@ -88,10 +93,19 @@ fn decode(bytes: &[u8], expected_key: &str) -> Option<Analysis> {
         return None;
     }
     let fps = f64::from_le_bytes(take(8)?.try_into().ok()?);
-    let count = usize::try_from(u64::from_le_bytes(take(8)?.try_into().ok()?)).ok()?;
-    let data = take(count.checked_mul(4)?)?;
-    let diffs = data.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-    (fps.is_finite() && fps > 0.0).then_some(Analysis { diffs, fps })
+    let n = usize::try_from(u64::from_le_bytes(take(8)?.try_into().ok()?)).ok()?;
+    if n == 0 || !(fps.is_finite() && fps > 0.0) {
+        return None;
+    }
+    let mut floats = |count: usize| -> Option<Vec<f32>> {
+        Some(take(count.checked_mul(4)?)?.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+    let diffs = floats(n - 1)?;
+    let luma = floats(n)?;
+    let sharpness = floats(n)?;
+    let color = take(n.checked_mul(3)?)?.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let hash = take(n.checked_mul(8)?)?.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+    rest.is_empty().then_some(Analysis { diffs, fps, luma, sharpness, hash, color })
 }
 
 /// Keep the cache from growing without bound: delete the least recently written entries.
@@ -124,7 +138,12 @@ mod tests {
     }
 
     fn sample() -> Analysis {
-        Analysis { diffs: vec![0.5, 80.25, 1.0], fps: 29.97 }
+        let mut a = Analysis::from_diffs(vec![0.5, 80.25, 1.0], 29.97);
+        a.luma[2] = 3.5;
+        a.sharpness[1] = 120.0;
+        a.hash[3] = u64::MAX - 7;
+        a.color[0] = [1, 2, 3];
+        a
     }
 
     #[test]
@@ -132,8 +151,7 @@ mod tests {
         let (cache, video) = setup("round_trip");
         assert!(load_in(&cache, &video).is_none());
         save_in(&cache, &video, &sample()).unwrap();
-        let loaded = load_in(&cache, &video).unwrap();
-        assert_eq!((loaded.diffs, loaded.fps), (sample().diffs, sample().fps));
+        assert_eq!(load_in(&cache, &video), Some(sample()));
     }
 
     #[test]

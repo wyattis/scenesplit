@@ -174,6 +174,37 @@ pub fn grab_frames_rgba(path: &Path, start: usize, count: usize, fps: f64, width
 
 /// Generates a 9 second, 25 fps test video: 3s moving pattern, 3s solid colour, 3s moving fractal.
 #[cfg(test)]
+/// 25 fps, 17 s: clip A (moving) crossfades into B (moving) over 3-4 s, B fades through black
+/// into a still C over 6-7 s, then hard cuts to D (moving) at 10 s and to C again at 14 s.
+/// So: a dissolve centred on frame 87, a fade with black at 162, cuts at 250 and 350.
+pub fn make_transition_video(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("scenesplit-test").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("input.mp4");
+    let src = |f: &str| ["-f".to_owned(), "lavfi".to_owned(), "-i".to_owned(), format!("{f}{}size=320x180:rate=25", if f.contains('=') { ":" } else { "=" })];
+    let status = command("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(src("testsrc2=duration=4"))
+        .args(src("mandelbrot"))
+        .args(src("smptehdbars=duration=3"))
+        .args(src("life=mold=10:ratio=0.5:death_color=#203040:life_color=#e0c040"))
+        .args(["-filter_complex", concat!(
+            "[1]trim=duration=4,setpts=PTS-STARTPTS[b];[3]trim=duration=4,setpts=PTS-STARTPTS,format=yuv420p,fps=25[d];",
+            "[0]format=yuv420p,fps=25[a];[2]format=yuv420p,fps=25,split[c1][c2];[b]format=yuv420p,fps=25[b2];",
+            "[a][b2]xfade=transition=fade:duration=1:offset=3[ab];",
+            "[ab][c1]xfade=transition=fadeblack:duration=1:offset=6[abc];",
+            "[abc][d][c2]concat=n=3:v=1[v]",
+        )])
+        .args(["-map", "[v]", "-pix_fmt", "yuv420p"])
+        .arg(&input)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    input
+}
+
+#[cfg(test)]
 pub fn make_test_video(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("scenesplit-test").join(name);
     let _ = std::fs::remove_dir_all(&dir);

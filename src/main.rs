@@ -11,6 +11,7 @@ mod player;
 mod project;
 mod scenes;
 mod sections;
+mod transitions;
 #[cfg(test)]
 mod ui_tests;
 

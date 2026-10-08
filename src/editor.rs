@@ -15,12 +15,14 @@ use eframe::egui::{
 use crate::project::Edits;
 use crate::scenes::{Cut, CutId, CutSource, ResolvedCuts, Scene, SceneKind};
 use crate::sections::Sections;
+use crate::transitions::{Transition, TransitionKind};
 
 pub const DETECTED_COLOR: Color32 = Color32::from_rgb(230, 120, 40);
 pub const MOVED_COLOR: Color32 = Color32::from_rgb(240, 200, 60);
 pub const MANUAL_COLOR: Color32 = Color32::from_rgb(190, 110, 230);
 const SELECTED_COLOR: Color32 = Color32::from_rgb(255, 255, 255);
 pub const SECTION_COLOR: Color32 = Color32::from_rgb(40, 170, 160);
+pub const LOOKALIKE_COLOR: Color32 = Color32::from_rgb(220, 170, 60);
 
 /// Frames shown on each side of the selected cut in the filmstrip.
 pub const STRIP_RADIUS: usize = 6;
@@ -80,6 +82,10 @@ pub enum Action {
     SetExcluded(CutId, bool),
     /// Choose which section the settings panel edits (`None`: the whole video).
     SelectSection(Option<u32>),
+    /// Use this frame for the scene's still image (`None`: back to the sharpest frame).
+    SetStillFrame(CutId, Option<usize>),
+    /// Leave every scene that looks like an earlier one out of the export.
+    ExcludeLookalikes,
     /// Make a section from the selected scenes.
     NewSection,
     DeleteSection(u32),
@@ -212,6 +218,18 @@ pub struct GraphInput<'a> {
     pub thresholds: Vec<(Range<usize>, Option<f32>)>,
     /// Sections to shade, and whether each is the one being edited.
     pub sections: Vec<(Range<usize>, bool)>,
+    /// Fades and dissolves, marked along the bottom.
+    pub transitions: &'a [Transition],
+}
+
+pub const FADE_COLOR: Color32 = Color32::from_rgb(150, 150, 170);
+pub const DISSOLVE_COLOR: Color32 = Color32::from_rgb(200, 110, 160);
+
+pub fn transition_label(kind: TransitionKind) -> (&'static str, Color32) {
+    match kind {
+        TransitionKind::Fade => ("fade", FADE_COLOR),
+        TransitionKind::Dissolve => ("dissolve", DISSOLVE_COLOR),
+    }
 }
 
 pub fn cut_color(source: CutSource) -> Color32 {
@@ -259,6 +277,21 @@ pub fn graph(ui: &mut egui::Ui, view: &mut EditorView, input: &GraphInput<'_>) -
         let v = (b0..b1).map(diff_at).fold(0.0f32, f32::max);
         if v > 0.0 {
             painter.vline(x + 0.5, to_y(v)..=rect.bottom(), bar);
+        }
+    }
+
+    // Transitions: a band along the bottom, labelled when there's room.
+    for t in input.transitions {
+        let (label, color) = transition_label(t.kind);
+        let xs = x_range(&t.frames);
+        if xs.end() - xs.start() < 1.0 {
+            continue;
+        }
+        let band = Rect::from_x_y_ranges(xs, rect.bottom() - 12.0..=rect.bottom());
+        painter.rect_filled(Rect::from_x_y_ranges(band.x_range(), rect.y_range()), 0.0, color.gamma_multiply(0.12));
+        painter.rect_filled(band, 2.0, color.gamma_multiply(0.6));
+        if band.width() > 40.0 {
+            painter.text(band.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(10.0), Color32::WHITE);
         }
     }
 

@@ -69,6 +69,10 @@ overrides! {
     cut_offset: i32,
     drop_before_cut: usize,
     drop_after_cut: usize,
+    detect_fades: bool,
+    black_level: f32,
+    detect_dissolves: bool,
+    trim_transitions: bool,
 }
 
 /// What a locked section keeps.

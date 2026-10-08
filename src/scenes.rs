@@ -1,8 +1,10 @@
 //! Turning per-frame difference scores into scenes. Pure and cheap to re-run.
 //!
-//! The pipeline is: [`sections::plan`] (which settings apply where) → [`detect`] →
-//! detected cuts + the user's [`CutEdits`] → [`resolve`] → [`build`]. The `*_cuts`/`build_scenes`
+//! The pipeline is: [`sections::plan`] (which settings apply where) → [`detect`] (cuts at
+//! spikes, fades and dissolves) → detected cuts + the user's [`CutEdits`] → [`resolve`] →
+//! [`build`] → [`pick_still_frames`] and [`find_lookalikes`]. The `*_cuts`/`build_scenes`
 //! functions are the same with one set of settings for the whole video.
+
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -10,7 +12,9 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
+use crate::analysis::Analysis;
 use crate::sections::{self, Span};
+use crate::transitions::{self, Transition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DetectMode {
@@ -45,6 +49,14 @@ pub struct Params {
     pub drop_before_cut: usize,
     /// Frames dropped from the start of the scene after each cut.
     pub drop_after_cut: usize,
+    /// Cut at fades through black.
+    pub detect_fades: bool,
+    /// Frames with mean brightness (0-255) below this count as black.
+    pub black_level: f32,
+    /// Cut at dissolves (crossfades).
+    pub detect_dissolves: bool,
+    /// Leave fade and dissolve frames out of the scenes on either side.
+    pub trim_transitions: bool,
 }
 
 impl Default for Params {
@@ -60,6 +72,10 @@ impl Default for Params {
             cut_offset: 0,
             drop_before_cut: 0,
             drop_after_cut: 0,
+            detect_fades: true,
+            black_level: 8.0,
+            detect_dissolves: true,
+            trim_transitions: true,
         }
     }
 }
@@ -229,10 +245,13 @@ pub struct Scene {
     /// Median frame-to-frame difference over the kept frames.
     pub motion: f32,
     pub kind: SceneKind,
+    /// Frame used for the thumbnail and the still image: the sharpest kept frame.
+    pub still_frame: usize,
+    /// Index of an earlier scene this one looks like, if any.
+    pub looks_like: Option<usize>,
 }
 
 impl Scene {
-    /// Frame used for thumbnails and still images.
     pub fn middle(&self) -> usize {
         if self.keep.is_empty() {
             self.start + (self.end - self.start) / 2
@@ -259,8 +278,35 @@ pub fn detect_cuts(diffs: &[f32], fps: f64, p: &Params) -> Vec<usize> {
     cuts
 }
 
-/// Detected cuts, each span using its own settings. Locked spans use their frozen cuts.
-pub fn detect(diffs: &[f32], fps: f64, spans: &[Span]) -> Vec<Detected> {
+/// What detection found with the current settings.
+#[derive(Debug, Clone, Default)]
+pub struct Detection {
+    pub cuts: Vec<Detected>,
+    pub transitions: Vec<Transition>,
+}
+
+/// Detected cuts and transitions, each span using its own settings. `dissolves` are the
+/// candidates from [`transitions::find_dissolves`]. Locked spans use their frozen cuts.
+pub fn detect(a: &Analysis, dissolves: &[Transition], spans: &[Span]) -> Detection {
+    let transitions = transitions::select(a, dissolves, spans);
+    let frozen = |f: usize| sections::span_at(spans, f).frozen.is_some();
+    // A cut at a transition replaces any spike cuts inside it.
+    let mut cuts: Vec<Detected> = spike_cuts(&a.diffs, a.fps, spans)
+        .into_iter()
+        .filter(|c| frozen(c.id) || !transitions.iter().any(|t| t.frames.start <= c.id && c.id <= t.frames.end))
+        .collect();
+    for cut in transitions.iter().filter_map(|t| t.cut) {
+        if !frozen(cut) {
+            cuts.push(Detected { id: cut, frame: cut as i64 + sections::span_at(spans, cut).params.cut_offset as i64 });
+        }
+    }
+    cuts.sort_by_key(|c| c.id);
+    cuts.dedup_by_key(|c| c.id);
+    Detection { cuts, transitions }
+}
+
+/// Cuts at spikes in the frame differences, each span using its own settings.
+fn spike_cuts(diffs: &[f32], fps: f64, spans: &[Span]) -> Vec<Detected> {
     let mut out = Vec::new();
     let mut last_cut = 0;
     for span in spans {
@@ -356,12 +402,13 @@ pub fn resolve(detected: &[Detected], edits: &CutEdits, frame_count: usize) -> R
 /// [`build`] with one set of settings.
 #[cfg(test)]
 pub fn build_scenes(diffs: &[f32], frame_count: usize, cuts: &[Cut], p: &Params) -> Vec<Scene> {
-    build(diffs, frame_count, cuts, &sections::plan(p, &Default::default(), frame_count))
+    build(diffs, frame_count, cuts, &sections::plan(p, &Default::default(), frame_count), &[])
 }
 
-/// Split `0..frame_count` at `cuts`, drop frames around each cut, and classify each scene.
-/// Each scene uses the settings of the span it starts in.
-pub fn build(diffs: &[f32], frame_count: usize, cuts: &[Cut], spans: &[Span]) -> Vec<Scene> {
+/// Split `0..frame_count` at `cuts`, drop frames around each cut (and transitions at the
+/// scene's edges), and classify each scene. Each scene uses the settings of the span it
+/// starts in.
+pub fn build(diffs: &[f32], frame_count: usize, cuts: &[Cut], spans: &[Span], transitions: &[Transition]) -> Vec<Scene> {
     let bounds: Vec<(CutId, usize)> = std::iter::once((CutId::Start, 0))
         .chain(cuts.iter().map(|c| (c.id, c.frame)).filter(|&(_, f)| f > 0 && f < frame_count))
         .chain(std::iter::once((CutId::Start, frame_count)))
@@ -374,23 +421,76 @@ pub fn build(diffs: &[f32], frame_count: usize, cuts: &[Cut], spans: &[Span]) ->
             let p = &sections::span_at(spans, start).params;
             // Only trim at real cuts, not at the very start or end of the video. Dropping more
             // frames than the scene has leaves an empty range, clamped to stay inside the scene.
-            let keep_start = if start == 0 { start } else { start.saturating_add(p.drop_after_cut).min(end) };
-            let keep_end = if end == frame_count { end } else { end.saturating_sub(p.drop_before_cut).max(start) };
+            let mut keep_start = if start == 0 { start } else { start.saturating_add(p.drop_after_cut).min(end) };
+            let mut keep_end = if end == frame_count { end } else { end.saturating_sub(p.drop_before_cut).max(start) };
+            if p.trim_transitions {
+                // Transitions overlapping the scene's start or end, not ones in its middle.
+                for t in transitions.iter().filter(|t| t.frames.start < end && start < t.frames.end) {
+                    if t.frames.start <= start {
+                        keep_start = keep_start.max(t.frames.end.min(end));
+                    }
+                    if t.frames.end >= end {
+                        keep_end = keep_end.min(t.frames.start.max(start));
+                    }
+                }
+            }
             let keep = keep_start..keep_end.max(keep_start);
 
             // Differences strictly inside the kept frames: diffs[i] compares frames i and i + 1.
             let inner_end = keep.end.saturating_sub(1).min(diffs.len());
             let motion = median(diffs.get(keep.start..inner_end).unwrap_or(&[]));
-            Scene {
-                id,
-                start,
-                end,
-                keep,
-                motion,
-                kind: if motion < p.still_threshold { SceneKind::Still } else { SceneKind::Video },
-            }
+            let kind = if motion < p.still_threshold { SceneKind::Still } else { SceneKind::Video };
+            let mut scene = Scene { id, start, end, keep, motion, kind, still_frame: 0, looks_like: None };
+            scene.still_frame = scene.middle();
+            scene
         })
         .collect()
+}
+
+/// Use each scene's sharpest kept frame for its thumbnail and still image, so a still isn't
+/// taken mid-fade or from a blurry frame. Among frames nearly as sharp, the one nearest the
+/// middle wins.
+pub fn pick_still_frames(scenes: &mut [Scene], sharpness: &[f32]) {
+    for scene in scenes {
+        let frames = scene.keep.start..scene.keep.end.min(sharpness.len());
+        let Some(best) = frames.clone().map(|f| sharpness[f]).max_by(f32::total_cmp) else { continue };
+        let middle = scene.middle();
+        if let Some(f) = frames.filter(|&f| sharpness[f] >= 0.97 * best).min_by_key(|f| f.abs_diff(middle)) {
+            scene.still_frame = f;
+        }
+    }
+}
+
+/// Frames that differ by at most this many hash bits and this much mean colour look alike.
+const LOOKALIKE_BITS: u32 = 5;
+const LOOKALIKE_COLOR: i32 = 15;
+/// Frames sampled from each earlier scene when comparing.
+const LOOKALIKE_SAMPLES: usize = 32;
+
+/// Flag scenes whose still frame looks like a frame of an earlier scene (repeated shots or
+/// images in a montage), pointing at the first such scene.
+pub fn find_lookalikes(scenes: &mut [Scene], a: &Analysis) {
+    let alike = |x: usize, y: usize| {
+        (a.hash[x] ^ a.hash[y]).count_ones() <= LOOKALIKE_BITS
+            && (0..3).map(|c| (a.color[x][c] as i32 - a.color[y][c] as i32).abs()).sum::<i32>() <= LOOKALIKE_COLOR
+    };
+    let samples: Vec<Vec<usize>> = scenes
+        .iter()
+        .map(|s| {
+            let keep = s.keep.start..s.keep.end.min(a.hash.len());
+            let step = keep.len().div_ceil(LOOKALIKE_SAMPLES).max(1);
+            let still = std::iter::once(s.still_frame).filter(|f| keep.contains(f));
+            keep.clone().step_by(step).chain(still).collect()
+        })
+        .collect();
+    for j in 0..scenes.len() {
+        let frame = scenes[j].still_frame;
+        scenes[j].looks_like = None;
+        if scenes[j].keep.is_empty() || frame >= a.hash.len() {
+            continue;
+        }
+        scenes[j].looks_like = (0..j).find(|&i| samples[i].iter().any(|&f| alike(f, frame)));
+    }
 }
 
 fn median(xs: &[f32]) -> f32 {
@@ -548,12 +648,17 @@ mod tests {
         assert!(serde_json::from_str::<CutId>(r#""x1""#).is_err());
     }
 
+    /// Detected cuts (no transitions) at 10 fps.
+    fn det(diffs: &[f32], spans: &[Span]) -> Vec<Detected> {
+        detect(&Analysis::from_diffs(diffs.to_vec(), 10.0), &[], spans).cuts
+    }
+
     fn bounds_with(sections: &Sections, global: &Params) -> Vec<(CutId, usize, usize)> {
         let d = sample();
         let spans = sections::plan(global, sections, d.len() + 1);
-        let detected = detect(&d, 10.0, &spans);
+        let detected = det(&d, &spans);
         let resolved = resolve(&detected, &CutEdits::default(), d.len() + 1);
-        super::build(&d, d.len() + 1, &resolved.cuts, &spans).iter().map(|s| (s.id, s.start, s.end)).collect()
+        super::build(&d, d.len() + 1, &resolved.cuts, &spans, &[]).iter().map(|s| (s.id, s.start, s.end)).collect()
     }
 
     #[test]
@@ -581,8 +686,8 @@ mod tests {
         sections.get_mut(id).unwrap().overrides.drop_after_cut = Some(1);
         sections.get_mut(id).unwrap().overrides.still_threshold = Some(0.0);
         let spans = sections::plan(&Params::default(), &sections, d.len() + 1);
-        let resolved = resolve(&detect(&d, 10.0, &spans), &CutEdits::default(), d.len() + 1);
-        let scenes = super::build(&d, d.len() + 1, &resolved.cuts, &spans);
+        let resolved = resolve(&det(&d, &spans), &CutEdits::default(), d.len() + 1);
+        let scenes = super::build(&d, d.len() + 1, &resolved.cuts, &spans, &[]);
         let got: Vec<_> = scenes.iter().map(|s| (s.keep.clone(), s.kind)).collect();
         assert_eq!(got, [(0..10, SceneKind::Video), (11..18, SceneKind::Video), (20..30, SceneKind::Video)]);
     }
@@ -594,7 +699,7 @@ mod tests {
         let before = bounds_with(&sections, &Params::default());
         // Lock with the cuts and settings the section has now.
         let spans = sections::plan(&Params::default(), &sections, 30);
-        let frozen = detect(&sample(), 10.0, &spans).iter().filter(|d| (15..30).contains(&d.id)).map(|d| (d.id, d.frame as usize)).collect();
+        let frozen = det(&sample(), &spans).iter().filter(|d| (15..30).contains(&d.id)).map(|d| (d.id, d.frame as usize)).collect();
         sections.get_mut(id).unwrap().lock = Some(Lock { params: spans[1].params.clone(), cuts: frozen });
 
         // A threshold nothing passes removes every cut, except inside the locked section.
@@ -613,7 +718,7 @@ mod tests {
         let mut sections = Sections::default();
         let id = sections.add(12..30).unwrap();
         let cuts = |sections: &Sections, global: &Params| {
-            detect(&d, 10.0, &sections::plan(global, sections, 30)).iter().map(|c| c.id).collect::<Vec<_>>()
+            det(&d, &sections::plan(global, sections, 30)).iter().map(|c| c.id).collect::<Vec<_>>()
         };
         assert_eq!(cuts(&sections, &global), [13]);
         sections.get_mut(id).unwrap().lock = Some(Lock { params: global.clone(), cuts: [(13, 13)].into() });
@@ -622,6 +727,51 @@ mod tests {
         let looser = Params { cut_threshold: 30.0, ..global.clone() };
         assert_eq!(cuts(&Sections::default(), &looser), [10]);
         assert_eq!(cuts(&sections, &looser), [10, 13]);
+    }
+
+    fn scene(start: usize, end: usize) -> Scene {
+        let mut s = Scene { id: CutId::Detected(start), start, end, keep: start..end, motion: 0.0, kind: SceneKind::Still, still_frame: 0, looks_like: None };
+        s.still_frame = s.middle();
+        s
+    }
+
+    #[test]
+    fn still_frame_is_the_sharpest_kept_frame_nearest_the_middle() {
+        // Frames 0..10: a blurry fade-in, then sharp. 10..20: evenly sharp. 20..30: sharpest at 22 and 28.
+        let mut sharpness = vec![500.0; 30];
+        sharpness[..4].copy_from_slice(&[0.0, 50.0, 200.0, 400.0]);
+        sharpness[22] = 900.0;
+        sharpness[28] = 900.0;
+        let mut scenes = vec![scene(0, 10), scene(10, 20), scene(20, 30)];
+        scenes[0].keep = 0..10;
+        pick_still_frames(&mut scenes, &sharpness);
+        let picked: Vec<_> = scenes.iter().map(|s| s.still_frame).collect();
+        assert_eq!(picked, [5, 15, 22], "ties go to the frame nearest the middle (25)");
+
+        // Only kept frames count.
+        scenes[2].keep = 23..30;
+        pick_still_frames(&mut scenes, &sharpness);
+        assert_eq!(scenes[2].still_frame, 28);
+    }
+
+    #[test]
+    fn lookalikes_point_at_the_first_similar_scene() {
+        let mut a = Analysis::from_diffs(vec![1.0; 39], 10.0);
+        for (range, hash, color) in [(0..10, 0xF0F0, [10, 20, 30]), (10..20, 0xAAAA_0000, [10, 20, 30]), (20..30, 0xF0F1, [12, 22, 30]), (30..40, 0xF0F0, [200, 20, 30])] {
+            for f in range {
+                a.hash[f] = hash;
+                a.color[f] = color;
+            }
+        }
+        let mut scenes = vec![scene(0, 10), scene(10, 20), scene(20, 30), scene(30, 40)];
+        find_lookalikes(&mut scenes, &a);
+        let got: Vec<_> = scenes.iter().map(|s| s.looks_like).collect();
+        // Scene 2 is one bit off scene 0; scene 3 has the same layout but a different colour.
+        assert_eq!(got, [None, None, Some(0), None]);
+
+        scenes[0].keep = 0..0;
+        find_lookalikes(&mut scenes, &a);
+        assert_eq!(scenes[2].looks_like, None, "frames that aren't exported don't count");
     }
 
     /// Sweeps every setting and edit across (and beyond) its UI range on videos of awkward

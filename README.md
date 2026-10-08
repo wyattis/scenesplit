@@ -21,14 +21,26 @@ buttons.
 ## How it works
 
 1. **Analyze** (`analysis.rs`): ffmpeg decodes the video once at 160x90, at a constant
-   frame rate, and the app records the mean RGB difference between consecutive frames.
+   frame rate. For each frame the app records the mean RGB difference from the previous
+   frame, brightness, sharpness (variance of the Laplacian), mean colour and a 64-bit
+   difference hash.
    Results are cached (`cache.rs`) in the user's cache directory, keyed by the video's
    path, size and modification time, so reopening a video is instant.
-2. **Detect** (`scenes.rs`): cuts are found from those cached scores, either above a fixed
-   threshold or relative to neighbouring frames (adaptive). A scene whose median motion is
-   below the still threshold is classified as a still. Cuts can be shifted by a frame offset,
-   and frames can be dropped before/after each cut. This step is instant, so the settings
-   update live.
+2. **Detect** (`scenes.rs`, `transitions.rs`): hard cuts are spikes in the difference,
+   either above a fixed threshold or relative to neighbouring frames (adaptive). Gradual
+   transitions don't spike, so they're found separately:
+   - *Fades through black*: frames darker than the black level, plus the darkening and
+     brightening ramps around them. The next scene starts where the picture comes back.
+   - *Dissolves*: a blend of two shots has less detail than either, following
+     `(1-t)²·a + t²·b`. Stretches whose sharpness fits that dip between two
+     different-looking frames are dissolves; the cut goes in the middle.
+
+   By default transition frames are left out of the scenes on both sides. A scene whose
+   median motion is below the still threshold is classified as a still; its image is the
+   sharpest kept frame (or one you pick with "Use playhead frame"). Scenes whose still frame
+   matches a frame of an earlier scene (hash and colour) are marked ≈ so repeats can be
+   skipped. Cuts can be shifted by a frame offset, and frames can be dropped before/after
+   each cut. This step is instant, so the settings update live.
 3. **Review** (`app.rs`, `player.rs`): thumbnails, difference graph, per-scene Video/Still
    override, include/exclude, merge with next, and a video-only preview player whose
    "loop selected scene" plays exactly the frames that will be exported.

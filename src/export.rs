@@ -23,6 +23,8 @@ pub struct ExportItem {
     pub kind: SceneKind,
     pub start: f64,
     pub end: f64,
+    /// Time of the frame saved for a still.
+    pub still: f64,
 }
 
 pub fn export_all(
@@ -46,7 +48,7 @@ pub fn export_all(
         let out = match item.kind {
             SceneKind::Still => {
                 let out = out_dir.join(format!("{stem}-{n:03}.png"));
-                export_still(input, (item.start + item.end) / 2.0, &out)?;
+                export_still(input, item.still, &out)?;
                 out
             }
             SceneKind::Video => {

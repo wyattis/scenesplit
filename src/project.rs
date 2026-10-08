@@ -20,6 +20,8 @@ pub struct Edits {
     pub excluded: BTreeSet<CutId>,
     /// Parts of the video with their own settings.
     pub sections: Sections,
+    /// Frames chosen by hand for still images, by scene.
+    pub still_frames: BTreeMap<CutId, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

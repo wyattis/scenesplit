@@ -20,6 +20,7 @@ use crate::player::Player;
 use crate::project::{self, Edits, History, Project};
 use crate::scenes::{self, CutEdits, CutId, CutSource, DetectMode, Detected, Params, ResolvedCuts, Scene, SceneKind};
 use crate::sections::{self, Lock, Section, Span};
+use crate::transitions::{self, Transition};
 
 const THUMB_W: u32 = 192;
 const STRIP_W: u32 = 160;
@@ -36,11 +37,19 @@ const NOTICE_DURATION: Duration = Duration::from_secs(4);
 enum Msg {
     AnalysisProgress(f32),
     /// `cached` is true when the analysis came from the on-disk cache.
-    AnalysisDone { generation: u64, path: PathBuf, result: Result<(VideoInfo, Analysis, bool)> },
+    AnalysisDone { generation: u64, path: PathBuf, result: Result<Analyzed> },
     Frames { generation: u64, kind: FrameKind, start: usize, size: [usize; 2], frames: Vec<Vec<u8>> },
     ExportProgress(usize),
     ExportDone(Result<Vec<PathBuf>>),
     FfmpegChecked(Result<String>),
+}
+
+struct Analyzed {
+    info: VideoInfo,
+    analysis: Analysis,
+    /// Dissolve candidates, which don't depend on settings (see `transitions::select`).
+    dissolves: Vec<Transition>,
+    cached: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,8 +76,11 @@ struct Loaded {
     analysis: Analysis,
     /// Which settings apply where.
     spans: Vec<Span>,
+    dissolves: Vec<Transition>,
     /// Cuts found by detection, before the user's edits.
     detected: Vec<Detected>,
+    /// Fades and dissolves with the current settings.
+    transitions: Vec<Transition>,
     cuts: ResolvedCuts,
     scenes: Vec<Scene>,
     frame_tx: Sender<FrameJob>,
@@ -227,23 +239,27 @@ impl App {
         let (tx, ctx, cancel, generation) = (self.tx.clone(), ctx.clone(), self.cancel.clone(), self.generation);
         std::thread::spawn(move || {
             let result = ffmpeg::probe(&path).and_then(|info| {
-                if let Some(analysis) = cache::load(&path) {
-                    return Ok((info, analysis, true));
-                }
-                let analysis = analysis::analyze(&path, &info, &cancel, |p| {
-                    let _ = tx.send(Msg::AnalysisProgress(p));
-                    ctx.request_repaint();
-                })?;
-                // A failed cache write only costs a re-analysis next time.
-                let _ = cache::save(&path, &analysis);
-                Ok((info, analysis, false))
+                let (analysis, cached) = match cache::load(&path) {
+                    Some(analysis) => (analysis, true),
+                    None => {
+                        let analysis = analysis::analyze(&path, &info, &cancel, |p| {
+                            let _ = tx.send(Msg::AnalysisProgress(p));
+                            ctx.request_repaint();
+                        })?;
+                        // A failed cache write only costs a re-analysis next time.
+                        let _ = cache::save(&path, &analysis);
+                        (analysis, false)
+                    }
+                };
+                let dissolves = transitions::find_dissolves(&analysis);
+                Ok(Analyzed { info, analysis, dissolves, cached })
             });
             let _ = tx.send(Msg::AnalysisDone { generation, path, result });
             ctx.request_repaint();
         });
     }
 
-    fn on_analysis_done(&mut self, ctx: &egui::Context, path: PathBuf, info: VideoInfo, analysis: Analysis) {
+    fn on_analysis_done(&mut self, ctx: &egui::Context, path: PathBuf, Analyzed { info, analysis, dissolves, cached }: Analyzed) {
         let frame_tx = spawn_frame_worker(ctx.clone(), self.tx.clone(), self.generation, path.clone(), &info, analysis.fps);
         let player = Player::new(&path, &info, analysis.fps, analysis.frame_count());
         self.view = EditorView::new(analysis.frame_count());
@@ -256,12 +272,17 @@ impl App {
             fmt_time(info.duration),
             if info.has_audio { " · audio" } else { "" },
         );
+        if cached {
+            self.status.push_str(" · analysis from cache");
+        }
         self.loaded = Some(Loaded {
             path,
             info,
             analysis,
             spans: Vec::new(),
+            dissolves,
             detected: Vec::new(),
+            transitions: Vec::new(),
             cuts: ResolvedCuts::default(),
             scenes: Vec::new(),
             frame_tx,
@@ -275,9 +296,17 @@ impl App {
         let Some(l) = &mut self.loaded else { return };
         let fc = l.frame_count();
         l.spans = sections::plan(&self.params, &self.edits.sections, fc);
-        l.detected = scenes::detect(&l.analysis.diffs, l.analysis.fps, &l.spans);
+        let detection = scenes::detect(&l.analysis, &l.dissolves, &l.spans);
+        (l.detected, l.transitions) = (detection.cuts, detection.transitions);
         l.cuts = scenes::resolve(&l.detected, &self.edits.cuts, fc);
-        l.scenes = scenes::build(&l.analysis.diffs, fc, &l.cuts.cuts, &l.spans);
+        l.scenes = scenes::build(&l.analysis.diffs, fc, &l.cuts.cuts, &l.spans, &l.transitions);
+        scenes::pick_still_frames(&mut l.scenes, &l.analysis.sharpness);
+        for scene in &mut l.scenes {
+            if let Some(&f) = self.edits.still_frames.get(&scene.id).filter(|f| scene.keep.contains(f)) {
+                scene.still_frame = f;
+            }
+        }
+        scenes::find_lookalikes(&mut l.scenes, &l.analysis);
         if self.selected.is_some_and(|id| !l.scenes.iter().any(|s| s.id == id)) {
             self.selected = None;
         }
@@ -486,6 +515,18 @@ impl App {
                 }
             }),
             Action::SelectSection(id) => self.selected_section = id,
+            Action::SetStillFrame(id, frame) => self.edit(None, |e| match frame {
+                Some(f) => {
+                    e.still_frames.insert(id, f);
+                }
+                None => {
+                    e.still_frames.remove(&id);
+                }
+            }),
+            Action::ExcludeLookalikes => {
+                let ids: Vec<CutId> = l.scenes.iter().filter(|s| s.looks_like.is_some()).map(|s| s.id).collect();
+                self.edit(None, |e| e.excluded.extend(ids));
+            }
             Action::NewSection => {
                 let Some(r) = self.selection() else {
                     self.notify("Select scenes first: click one, then Shift+click another to select a range.");
@@ -547,6 +588,7 @@ impl App {
                 kind: self.effective_kind(s),
                 start: l.analysis.frame_time(s.keep.start),
                 end: l.analysis.frame_time(s.keep.end),
+                still: l.analysis.frame_time(s.still_frame),
             })
             .collect();
         if items.is_empty() {
@@ -580,12 +622,7 @@ impl App {
                 Msg::AnalysisDone { generation, path, result } if generation == self.generation => {
                     self.task = Task::Idle;
                     match result {
-                        Ok((info, analysis, cached)) => {
-                            self.on_analysis_done(ctx, path, info, analysis);
-                            if cached {
-                                self.status.push_str(" · analysis from cache");
-                            }
-                        }
+                        Ok(analyzed) => self.on_analysis_done(ctx, path, analyzed),
                         Err(e) => self.status = format!("Analysis failed: {e:#}"),
                     }
                 }
@@ -820,6 +857,37 @@ impl App {
                     ui.add(egui::DragValue::new(&mut p.drop_after_cut).range(0..=600).speed(0.1));
                 });
                 ui.end_row();
+
+                label(ui, "detect_fades", "Fades through black").on_hover_text(
+                    "Cut where the picture fades to black and back (or cuts to black).\n\
+                     Frames darker than the black level count as black.",
+                );
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut p.detect_fades, "");
+                    ui.add_enabled_ui(p.detect_fades, |ui| {
+                        if overridden("black_level") {
+                            label(ui, "black_level", "black level");
+                        } else {
+                            ui.label("black level");
+                        }
+                        ui.add(egui::DragValue::new(&mut p.black_level).range(0.0..=60.0).speed(0.1));
+                    });
+                });
+                label(ui, "detect_dissolves", "Dissolves").on_hover_text(
+                    "Cut in the middle of crossfades between clips, found from the dip in detail\n\
+                     while two pictures are blended.",
+                );
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut p.detect_dissolves, "");
+                    if overridden("trim_transitions") {
+                        label(ui, "trim_transitions", "");
+                    }
+                    ui.checkbox(&mut p.trim_transitions, "Drop transition frames").on_hover_text(
+                        "Leave fade and dissolve frames out of the scenes on either side,\n\
+                         so clips don't start or end mid-transition.",
+                    );
+                });
+                ui.end_row();
             });
         });
         // The drop label resets both values.
@@ -863,6 +931,7 @@ impl App {
             fps: l.analysis.fps,
             playhead: l.player.position(),
             selected_cut: self.selected_cut,
+            transitions: &l.transitions,
             thresholds: l
                 .spans
                 .iter()
@@ -895,8 +964,20 @@ impl App {
         let stills = l.scenes.iter().filter(|s| self.effective_kind(s) == SceneKind::Still).count();
         let empty = l.scenes.iter().filter(|s| s.keep.is_empty()).count();
         let edited = l.cuts.cuts.iter().filter(|c| c.source != CutSource::Detected).count() + l.cuts.removed.len();
+        let lookalikes = l.scenes.iter().filter(|s| s.looks_like.is_some() && self.will_export(s)).count();
+        let count = |kind| l.transitions.iter().filter(|t| t.kind == kind).count();
+        let (fades, dissolves) = (count(transitions::TransitionKind::Fade), count(transitions::TransitionKind::Dissolve));
         ui.horizontal(|ui| {
             ui.label(format!("{n} scenes · {stills} stills · {} clips", n - stills));
+            if fades + dissolves > 0 {
+                ui.label(RichText::new(format!("· {fades} fades, {dissolves} dissolves")).weak());
+            }
+            if lookalikes > 0 {
+                ui.label(RichText::new(format!("· {lookalikes} look like earlier scenes")).color(editor::LOOKALIKE_COLOR));
+                if ui.small_button("Don't export them").on_hover_text("Untick Export on every scene marked ≈").clicked() {
+                    actions.push(Action::ExcludeLookalikes);
+                }
+            }
             if edited > 0 {
                 ui.label(RichText::new(format!("· {edited} cut edits")).weak());
             }
@@ -1053,7 +1134,7 @@ impl App {
             visible = range.start + 1..range.end.saturating_sub(1);
             for i in range {
                 let scene = &l.scenes[i];
-                let thumb_frame = scene.middle();
+                let thumb_frame = scene.still_frame;
                 if self.thumbs_requested.insert(thumb_frame) {
                     let _ = l.frame_tx.send(FrameJob { kind: FrameKind::Thumb, start: thumb_frame, count: 1 });
                 }
@@ -1099,6 +1180,10 @@ impl App {
                                 }
                                 _ => {}
                             }
+                            if let Some(other) = scene.looks_like {
+                                ui.label(RichText::new(format!("≈ #{}", other + 1)).small().color(editor::LOOKALIKE_COLOR))
+                                    .on_hover_text(format!("Looks like scene #{}", other + 1));
+                            }
                             let section = l.spans.first().and_then(|_| sections::span_at(&l.spans, scene.start).section);
                             if let Some(n) = section.and_then(|id| self.edits.sections.number(id)) {
                                 ui.label(RichText::new(format!("section {n}")).small().color(editor::SECTION_COLOR));
@@ -1135,6 +1220,26 @@ impl App {
                                 actions.push(Action::DeleteCut(l.scenes[i + 1].id));
                             }
                         });
+                        if self.edits.kinds.get(&scene.id).copied().unwrap_or(scene.kind) == SceneKind::Still && !scene.keep.is_empty() {
+                            ui.horizontal(|ui| {
+                                let chosen = self.edits.still_frames.get(&scene.id).is_some_and(|f| scene.keep.contains(f));
+                                let how = if chosen { "chosen by hand" } else { "sharpest" };
+                                ui.label(RichText::new(format!("Still frame #{} ({how})", scene.still_frame)).weak());
+                                let playhead = l.player.position();
+                                let in_scene = scene.keep.contains(&playhead);
+                                if ui
+                                    .add_enabled(in_scene, egui::Button::new("Use playhead frame").small())
+                                    .on_hover_text("Save the frame under the playhead instead")
+                                    .on_disabled_hover_text("Move the playhead into this scene's exported frames first")
+                                    .clicked()
+                                {
+                                    actions.push(Action::SetStillFrame(scene.id, Some(playhead)));
+                                }
+                                if chosen && ui.small_button("Auto").on_hover_text("Go back to the sharpest frame").clicked() {
+                                    actions.push(Action::SetStillFrame(scene.id, None));
+                                }
+                            });
+                        }
                     });
                 });
 
@@ -1287,6 +1392,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transitions::TransitionKind;
+    use std::ops::Range;
 
     fn cut_frames(app: &App) -> Vec<(usize, CutSource)> {
         app.loaded.as_ref().unwrap().cuts.cuts.iter().map(|c| (c.frame, c.source)).collect()
@@ -1422,6 +1529,67 @@ mod tests {
         open_and_wait(&ctx, &mut reopened, &input);
         assert_eq!(reopened.edits.sections, app.edits.sections);
         assert_eq!(cut_frames(&reopened), [(153, CutSource::Detected)]);
+        let _ = std::fs::remove_file(project::sidecar_path(&input));
+    }
+
+    /// Fades, dissolves, still frames and look-alikes against a real video (see
+    /// `ffmpeg::make_transition_video`).
+    #[test]
+    #[ignore = "needs ffmpeg on PATH"]
+    fn transitions_end_to_end() {
+        let input = ffmpeg::make_transition_video("transitions");
+        let _ = std::fs::remove_file(project::sidecar_path(&input));
+        let ctx = egui::Context::default();
+        let mut app = App::empty();
+        open_and_wait(&ctx, &mut app, &input);
+        let l = app.loaded.as_ref().unwrap();
+
+        // The crossfade over frames 75..100 and the fade through black over 150..175.
+        let [dissolve, fade] = &l.transitions[..] else { panic!("{:?}", l.transitions) };
+        assert_eq!(dissolve.kind, TransitionKind::Dissolve);
+        assert!((72..=77).contains(&dissolve.frames.start) && (99..=112).contains(&dissolve.frames.end), "{dissolve:?}");
+        let mid = dissolve.cut.unwrap();
+        assert!((84..=96).contains(&mid), "{dissolve:?}");
+        assert_eq!((fade.kind, fade.frames.clone(), fade.cut), (TransitionKind::Fade, 151..175, Some(160)));
+
+        // Scenes A, B, C (still), D, C again. Transition frames are left out of the clips.
+        let scenes = |app: &App| -> Vec<(usize, usize, Range<usize>, SceneKind, Option<usize>)> {
+            app.loaded.as_ref().unwrap().scenes.iter().map(|s| (s.start, s.end, s.keep.clone(), s.kind, s.looks_like)).collect()
+        };
+        use SceneKind::{Still, Video};
+        let (d0, d1) = (dissolve.frames.start, dissolve.frames.end);
+        assert_eq!(
+            scenes(&app),
+            [
+                (0, mid, 0..d0, Video, None),
+                (mid, 160, d1..151, Video, None),
+                (160, 225, 175..225, Still, None),
+                (225, 325, 225..325, Video, None),
+                (325, 400, 325..400, Still, Some(2)),
+            ]
+        );
+
+        // The still is the sharpest frame; a hand-picked one overrides it until reset.
+        let still = |app: &App| app.loaded.as_ref().unwrap().scenes[2].still_frame;
+        let sharpness = &l.analysis.sharpness;
+        assert!(sharpness[still(&app)] >= 0.97 * sharpness[175..225].iter().copied().fold(0.0, f32::max));
+        let id = l.scenes[2].id;
+        app.apply(Action::SetStillFrame(id, Some(190)));
+        assert_eq!(still(&app), 190);
+        app.apply(Action::SetStillFrame(id, None));
+        assert_ne!(still(&app), 190);
+
+        app.apply(Action::ExcludeLookalikes);
+        let excluded: Vec<bool> = app.loaded.as_ref().unwrap().scenes.iter().map(|s| app.edits.excluded.contains(&s.id)).collect();
+        assert_eq!(excluded, [false, false, false, false, true]);
+
+        // Settings: keep the transition frames, then stop detecting dissolves.
+        app.params.trim_transitions = false;
+        app.recompute();
+        assert_eq!(scenes(&app)[2].2, 160..225);
+        app.params.detect_dissolves = false;
+        app.recompute();
+        assert_eq!(app.cut_frames(), [160, 225, 325]);
         let _ = std::fs::remove_file(project::sidecar_path(&input));
     }
 

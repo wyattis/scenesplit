@@ -86,6 +86,7 @@ fn graph_harness(edits: CutEdits) -> Harness<'static, GraphState> {
                     selected_cut: None,
                     thresholds: vec![(0..FRAMES, Some(8.0))],
                     sections: Vec::new(),
+                    transitions: &[],
                 };
                 let actions = editor::graph(ui, &mut s.view, &input);
                 s.actions.extend(actions);
