@@ -1,7 +1,7 @@
 # Scene Split
 
 Desktop app (Rust + egui) that splits a video made of multiple clips into separate
-clips, exporting static scenes as single PNG images.
+clips, exporting static scenes as single images.
 
 Uses `ffmpeg` and `ffprobe`: the `with-ffmpeg` release archives include them next to the
 executable, which the app checks first; otherwise they need to be on `PATH`. The app shows a warning at
@@ -70,8 +70,18 @@ buttons.
    scene overview: click one to edit it, drag an edge to resize (snaps to cuts). **Lock**
    freezes a section's settings and detected cuts so later changes elsewhere can't affect
    it. Detected cuts and scenes use the settings of the section they start in.
-6. **Export** (`export.rs`): clips via ffmpeg (exact re-encode or fast stream copy),
-   stills as PNG of the scene's middle frame.
+6. **Export** (`export.rs`): clips as MP4, WebM, GIF or a stream copy of the original
+   (fast and lossless, but cuts snap to keyframes); stills as PNG, JPG or WebP. Under
+   "Options": a maximum size (shorter side, never scaled up), a quality preset, how many
+   files to export at once, and a file-name pattern with `{name}`, `{n}`, `{time}`,
+   `{frame}` and `{kind}`. Names that would collide are refused before anything is
+   written. A window shows each file's progress; a failed file doesn't stop the others.
+   Export settings are remembered between runs (`export.json` in the user's config
+   directory).
+7. **Scene list** (`cutlist.rs`): "Save scene list" writes every scene as CSV or JSON, or
+   the exported scenes as a CMX 3600 EDL to import into Resolve, Premiere and the like and
+   do the cutting there. The EDL uses non-drop-frame timecode starting at 00:00:00:00 for
+   the source; a video with an embedded start timecode will be offset by it.
 
 ## Releases
 

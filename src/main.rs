@@ -4,6 +4,7 @@
 mod analysis;
 mod app;
 mod cache;
+mod cutlist;
 mod editor;
 mod export;
 mod ffmpeg;

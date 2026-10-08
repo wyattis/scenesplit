@@ -183,7 +183,7 @@ fn dhash(gray: &[f32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export::{self, CutMode, ExportItem};
+    use crate::export::{self, ExportItem, ExportSettings};
     use crate::scenes::{self, CutEdits, Params, SceneKind};
 
     /// End-to-end check against real ffmpeg: moving clip, static frame, moving clip.
@@ -214,12 +214,16 @@ mod tests {
             .map(|(index, s)| ExportItem {
                 index,
                 kind: s.kind,
+                frame: s.start,
                 start: analysis.frame_time(s.start),
                 end: analysis.frame_time(s.end),
                 still: analysis.frame_time(s.still_frame),
             })
             .collect();
-        let out = export::export_all(&input, &dir.join("out"), &items, CutMode::Exact, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+        let settings = ExportSettings::default();
+        let jobs = export::plan(&input, &dir.join("out"), &items, &settings).unwrap();
+        export::run(&input, &jobs, &settings, &AtomicBool::new(false), |_, _| {}).unwrap();
+        let out: Vec<_> = jobs.iter().map(|j| &j.out).collect();
         let names: Vec<_> = out.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["input-001.mp4", "input-002.png", "input-003.mp4"]);
         assert!(out.iter().all(|p| p.metadata().unwrap().len() > 0));

@@ -13,8 +13,9 @@ use eframe::egui::{
 
 use crate::analysis::{self, Analysis};
 use crate::cache;
+use crate::cutlist::{self, Row};
 use crate::editor::{self, Action, EditorView, fmt_time};
-use crate::export::{self, CutMode, ExportItem};
+use crate::export::{self, ClipFormat, ExportItem, ExportSettings, JobState, Quality, StillFormat};
 use crate::ffmpeg::{self, VideoInfo};
 use crate::player::Player;
 use crate::project::{self, Edits, History, Project};
@@ -39,8 +40,9 @@ enum Msg {
     /// `cached` is true when the analysis came from the on-disk cache.
     AnalysisDone { generation: u64, path: PathBuf, result: Result<Analyzed> },
     Frames { generation: u64, kind: FrameKind, start: usize, size: [usize; 2], frames: Vec<Vec<u8>> },
-    ExportProgress(usize),
-    ExportDone(Result<Vec<PathBuf>>),
+    /// A file being exported changed state; `usize` is its index in [`ExportRun::names`].
+    ExportUpdate(usize, JobState),
+    ExportDone(Result<()>),
     FfmpegChecked(Result<String>),
 }
 
@@ -67,7 +69,53 @@ struct FrameJob {
 enum Task {
     Idle,
     Analyzing(f32),
-    Exporting { done: usize, total: usize },
+    Exporting,
+}
+
+/// The files of the current or last export.
+struct ExportRun {
+    out_dir: PathBuf,
+    names: Vec<String>,
+    states: Vec<JobState>,
+    finished: bool,
+    /// Whether its window is open.
+    show: bool,
+}
+
+impl ExportRun {
+    fn count(&self, f: impl Fn(&JobState) -> bool) -> usize {
+        self.states.iter().filter(|s| f(s)).count()
+    }
+
+    /// Overall fraction done.
+    fn progress(&self) -> f32 {
+        let sum: f32 = self
+            .states
+            .iter()
+            .map(|s| match s {
+                JobState::Waiting => 0.0,
+                JobState::Running(p) => *p,
+                _ => 1.0,
+            })
+            .sum();
+        sum / self.states.len().max(1) as f32
+    }
+
+    fn summary(&self) -> String {
+        let done = self.count(|s| *s == JobState::Done);
+        let failed = self.count(|s| matches!(s, JobState::Failed(_)));
+        let cancelled = self.count(|s| *s == JobState::Cancelled);
+        let total = self.states.len();
+        let mut text = match self.finished {
+            false => format!("Exporting: {done} of {total} done"),
+            true if cancelled > 0 => format!("Cancelled: {done} of {total} exported"),
+            true => format!("Exported {done} of {total} files"),
+        };
+        if failed > 0 {
+            text += &format!(", {failed} failed");
+        }
+        text + "."
+    }
 }
 
 struct Loaded {
@@ -139,7 +187,11 @@ pub struct App {
     strip_requested: HashSet<usize>,
 
     out_dir: Option<PathBuf>,
-    cut_mode: CutMode,
+    export: ExportSettings,
+    /// `export` as last saved, to save again when it changes.
+    saved_export: ExportSettings,
+    show_export_options: bool,
+    export_run: Option<ExportRun>,
 }
 
 impl App {
@@ -184,7 +236,10 @@ impl App {
             strip: HashMap::new(),
             strip_requested: HashSet::new(),
             out_dir: None,
-            cut_mode: CutMode::Exact,
+            export: export::load_settings(),
+            saved_export: export::load_settings(),
+            show_export_options: false,
+            export_run: None,
         }
     }
 
@@ -576,39 +631,98 @@ impl App {
         }
     }
 
-    fn start_export(&mut self, ctx: &egui::Context) {
-        let (Some(l), Some(out_dir)) = (&self.loaded, self.out_dir.clone()) else { return };
-        let items: Vec<ExportItem> = l
-            .scenes
+    /// The scenes ticked for export, in order.
+    fn export_items(&self) -> Vec<ExportItem> {
+        let Some(l) = &self.loaded else { return Vec::new() };
+        l.scenes
             .iter()
             .enumerate()
             .filter(|(_, s)| self.will_export(s))
             .map(|(index, s)| ExportItem {
                 index,
                 kind: self.effective_kind(s),
+                frame: s.keep.start,
                 start: l.analysis.frame_time(s.keep.start),
                 end: l.analysis.frame_time(s.keep.end),
                 still: l.analysis.frame_time(s.still_frame),
             })
-            .collect();
-        if items.is_empty() {
-            self.notify("Nothing selected to export.");
-            return;
-        }
+            .collect()
+    }
+
+    /// The files an export would write, or why the name pattern doesn't work.
+    fn export_jobs(&self) -> Result<Vec<export::Job>, String> {
+        let (Some(l), Some(out_dir)) = (&self.loaded, &self.out_dir) else { return Ok(Vec::new()) };
+        export::plan(&l.path, out_dir, &self.export_items(), &self.export)
+    }
+
+    fn start_export(&mut self, ctx: &egui::Context) {
+        let (Some(l), Some(out_dir)) = (&self.loaded, self.out_dir.clone()) else { return };
+        let jobs = match self.export_jobs() {
+            Ok(jobs) if jobs.is_empty() => return self.notify("Nothing selected to export."),
+            Ok(jobs) => jobs,
+            Err(e) => return self.notify(e),
+        };
 
         self.cancel = Arc::new(AtomicBool::new(false));
-        self.task = Task::Exporting { done: 0, total: items.len() };
+        self.task = Task::Exporting;
         self.status = format!("Exporting to {}…", out_dir.display());
+        self.export_run = Some(ExportRun {
+            out_dir,
+            names: jobs.iter().map(|j| j.out.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect(),
+            states: vec![JobState::Waiting; jobs.len()],
+            finished: false,
+            show: true,
+        });
         let (tx, ctx, cancel) = (self.tx.clone(), ctx.clone(), self.cancel.clone());
-        let (input, mode) = (l.path.clone(), self.cut_mode);
+        let (input, settings) = (l.path.clone(), self.export.clone());
         std::thread::spawn(move || {
-            let result = export::export_all(&input, &out_dir, &items, mode, &cancel, |done| {
-                let _ = tx.send(Msg::ExportProgress(done));
+            let result = export::run(&input, &jobs, &settings, &cancel, |i, state| {
+                let _ = tx.send(Msg::ExportUpdate(i, state));
                 ctx.request_repaint();
             });
             let _ = tx.send(Msg::ExportDone(result));
             ctx.request_repaint();
         });
+    }
+
+    /// The scene list as [`cutlist`] rows.
+    fn cut_list_rows(&self) -> Vec<Row> {
+        let Some(l) = &self.loaded else { return Vec::new() };
+        l.scenes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Row {
+                number: i + 1,
+                kind: self.effective_kind(s),
+                scene: s.start..s.end,
+                keep: s.keep.clone(),
+                still_frame: s.still_frame,
+                export: self.will_export(s),
+                looks_like: s.looks_like.map(|j| j + 1),
+            })
+            .collect()
+    }
+
+    fn cut_list(&self, format: cutlist::Format) -> String {
+        let Some(l) = &self.loaded else { return String::new() };
+        let video = l.path.file_name().unwrap_or_default().to_string_lossy();
+        cutlist::write(format, &self.cut_list_rows(), l.analysis.fps, &video, l.info.has_audio)
+    }
+
+    fn save_cut_list(&mut self, format: cutlist::Format) {
+        let Some(l) = &self.loaded else { return };
+        let stem = l.path.file_stem().unwrap_or_default().to_string_lossy();
+        let mut dialog = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}-scenes.{}", format.ext()))
+            .add_filter(format.ext().to_uppercase(), &[format.ext()]);
+        if let Some(dir) = l.path.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else { return };
+        match std::fs::write(&path, self.cut_list(format)) {
+            Ok(()) => self.notify(format!("Saved {}.", path.display())),
+            Err(e) => self.notify(format!("Could not save {}: {e}", path.display())),
+        }
     }
 
     fn handle_messages(&mut self, ctx: &egui::Context) {
@@ -638,9 +752,9 @@ impl App {
                     }
                 }
                 Msg::AnalysisDone { .. } | Msg::Frames { .. } => {}
-                Msg::ExportProgress(done) => {
-                    if let Task::Exporting { total, .. } = self.task {
-                        self.task = Task::Exporting { done, total };
+                Msg::ExportUpdate(i, state) => {
+                    if let Some(state_i) = self.export_run.as_mut().and_then(|r| r.states.get_mut(i)) {
+                        *state_i = state;
                     }
                 }
                 Msg::FfmpegChecked(result) => self.ffmpeg = Some(result.map_err(|e| format!("{e:#}"))),
@@ -649,8 +763,12 @@ impl App {
                     if let Some(l) = &self.loaded {
                         self.status = format!("{}", l.path.file_name().unwrap_or_default().to_string_lossy());
                     }
+                    let summary = self.export_run.as_mut().map(|run| {
+                        run.finished = true;
+                        run.summary()
+                    });
                     match result {
-                        Ok(files) => self.notify(format!("Exported {} files.", files.len())),
+                        Ok(()) => self.notify(summary.unwrap_or_default()),
                         Err(e) => self.notify(format!("Export failed: {e:#}")),
                     }
                 }
@@ -697,12 +815,14 @@ impl App {
                         self.cancel.store(true, Ordering::Relaxed);
                     }
                 }
-                Task::Exporting { done, total } => {
-                    ui.add(
-                        egui::ProgressBar::new(done as f32 / total as f32)
-                            .desired_width(200.0)
-                            .text(format!("{done}/{total}")),
-                    );
+                Task::Exporting => {
+                    if let Some(run) = &mut self.export_run {
+                        let done = run.count(|s| !matches!(s, JobState::Waiting | JobState::Running(_)));
+                        let bar = egui::ProgressBar::new(run.progress()).desired_width(200.0).text(format!("{done}/{}", run.names.len()));
+                        if ui.add(bar).interact(Sense::click()).on_hover_text("Show each file's progress").clicked() {
+                            run.show = true;
+                        }
+                    }
                     if ui.button("Cancel").clicked() {
                         self.cancel.store(true, Ordering::Relaxed);
                     }
@@ -989,17 +1109,34 @@ impl App {
     }
 
     fn export_bar(&mut self, ui: &mut egui::Ui) {
+        let jobs = self.export_jobs();
         // Wraps on narrow windows. The export button comes first so it's never pushed
         // off-screen, and the path goes last so it can be truncated to whatever space is left.
         ui.horizontal_wrapped(|ui| {
             let count = self.loaded.as_ref().map_or(0, |l| l.scenes.iter().filter(|s| self.will_export(s)).count());
-            let can_export = !self.busy() && count > 0 && self.out_dir.is_some();
-            if ui.add_enabled(can_export, egui::Button::new(format!("Export {count} scenes"))).clicked() {
+            let can_export = !self.busy() && count > 0 && self.out_dir.is_some() && jobs.is_ok();
+            let button = ui.add_enabled(can_export, egui::Button::new(format!("Export {count} scenes")));
+            if let Err(e) = &jobs {
+                button.on_disabled_hover_text(e);
+            } else if button.clicked() {
                 self.start_export(ui.ctx());
             }
+            ui.toggle_value(&mut self.show_export_options, "⚙ Options");
+            let mut summary = vec![self.export.clips.label().split(' ').next().unwrap_or_default(), self.export.stills.label()];
+            let size = self.export.max_size.map(|m| format!("≤{m}p"));
+            summary.extend(size.as_deref());
+            ui.label(RichText::new(summary.join(" · ")).weak());
             ui.separator();
-            ui.radio_value(&mut self.cut_mode, CutMode::Exact, "Exact (re-encode)");
-            ui.radio_value(&mut self.cut_mode, CutMode::Fast, "Fast (copy, keyframe-aligned)");
+            let loaded = self.loaded.is_some();
+            ui.add_enabled_ui(loaded, |ui| {
+                ui.menu_button("Save scene list", |ui| {
+                    for format in cutlist::Format::ALL {
+                        if ui.button(format.label()).on_hover_text(format.hint()).clicked() {
+                            self.save_cut_list(format);
+                        }
+                    }
+                });
+            });
             ui.separator();
             ui.label("Output:");
             if ui.button("Change…").clicked() {
@@ -1010,6 +1147,109 @@ impl App {
             let shown = self.out_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "—".into());
             ui.add(egui::Label::new(RichText::new(&shown).monospace()).truncate()).on_hover_text(shown);
         });
+        if self.show_export_options {
+            ui.add_space(4.0);
+            self.export_options(ui, &jobs);
+        }
+    }
+
+    fn export_options(&mut self, ui: &mut egui::Ui, jobs: &Result<Vec<export::Job>, String>) {
+        let s = &mut self.export;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Clips:");
+            egui::ComboBox::from_id_salt("clip format").selected_text(s.clips.label()).show_ui(ui, |ui| {
+                for f in ClipFormat::ALL {
+                    ui.selectable_value(&mut s.clips, f, f.label()).on_hover_text(f.hint());
+                }
+            });
+            ui.label("Stills:");
+            egui::ComboBox::from_id_salt("still format").selected_text(s.stills.label()).show_ui(ui, |ui| {
+                for f in StillFormat::ALL {
+                    ui.selectable_value(&mut s.stills, f, f.label());
+                }
+            });
+            ui.separator();
+            // Copying can't resize or re-compress, but stills still can.
+            let note = "Doesn't apply to clips copied as Original";
+            ui.label("Size:").on_hover_text("Scale down so the shorter side is at most this many pixels. Never scales up.");
+            let size_text = |m: Option<u32>| m.map_or("Original".to_owned(), |m| format!("{m}p"));
+            egui::ComboBox::from_id_salt("max size").selected_text(size_text(s.max_size)).show_ui(ui, |ui| {
+                ui.selectable_value(&mut s.max_size, None, size_text(None));
+                for m in export::MAX_SIZES {
+                    ui.selectable_value(&mut s.max_size, Some(m), size_text(Some(m)));
+                }
+            });
+            ui.label("Quality:");
+            let quality = egui::ComboBox::from_id_salt("quality").selected_text(s.quality.label()).show_ui(ui, |ui| {
+                for q in Quality::ALL {
+                    ui.selectable_value(&mut s.quality, q, q.label());
+                }
+            });
+            if s.clips == ClipFormat::Original {
+                quality.response.on_hover_text(note);
+            }
+            ui.separator();
+            ui.label("At once:").on_hover_text("Files exported at the same time");
+            ui.add(egui::DragValue::new(&mut s.jobs).range(1..=export::max_jobs()));
+        });
+        ui.horizontal_wrapped(|ui| {
+            let placeholders: Vec<String> = export::PLACEHOLDERS.iter().map(|(p, what)| format!("{p}  {what}")).collect();
+            ui.label("File names:").on_hover_text(placeholders.join("\n"));
+            ui.add(egui::TextEdit::singleline(&mut s.name_pattern).desired_width(220.0).font(egui::TextStyle::Monospace))
+                .on_hover_text(placeholders.join("\n"));
+            match jobs {
+                Ok(jobs) => {
+                    if let Some(job) = jobs.first() {
+                        let name = job.out.file_name().unwrap_or_default().to_string_lossy();
+                        ui.label(RichText::new(format!("e.g. {name}")).weak());
+                    }
+                }
+                Err(e) => {
+                    ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+                }
+            }
+        });
+    }
+
+    /// Each file of the current or last export and how it's going.
+    fn export_window(&mut self, ctx: &egui::Context) {
+        let exporting = matches!(self.task, Task::Exporting);
+        let Some(run) = &mut self.export_run else { return };
+        let mut open = run.show;
+        let mut close = false;
+        egui::Window::new("Export").open(&mut open).default_width(420.0).resizable(true).show(ctx, |ui| {
+            ui.label(run.summary());
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                egui::Grid::new("export files").num_columns(2).striped(true).show(ui, |ui| {
+                    for (name, state) in run.names.iter().zip(&run.states) {
+                        ui.add(egui::Label::new(RichText::new(name).monospace()).truncate());
+                        match state {
+                            JobState::Waiting => ui.label(RichText::new("waiting").weak()),
+                            JobState::Running(p) => ui.add(egui::ProgressBar::new(*p).desired_width(120.0).show_percentage()),
+                            JobState::Done => ui.label("✔ done"),
+                            JobState::Failed(e) => ui.label(RichText::new("✖ failed").color(ui.visuals().error_fg_color)).on_hover_text(e),
+                            JobState::Cancelled => ui.label(RichText::new("cancelled").weak()),
+                        };
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if exporting {
+                    if ui.button("Cancel").clicked() {
+                        self.cancel.store(true, Ordering::Relaxed);
+                    }
+                } else {
+                    if ui.button("🗁 Show folder").clicked() {
+                        show_folder(&run.out_dir);
+                    }
+                    close = ui.button("Close").clicked();
+                }
+            });
+        });
+        run.show = open && !close;
     }
 
     fn player_panel(&mut self, ui: &mut egui::Ui) -> Vec<Action> {
@@ -1272,6 +1512,12 @@ impl eframe::App for App {
         if let Some(l) = &mut self.loaded {
             l.player.tick(ctx);
         }
+        if self.export != self.saved_export {
+            self.saved_export = self.export.clone();
+            if let Err(e) = export::save_settings(&self.export) {
+                self.notify(format!("Could not save export settings: {e:#}"));
+            }
+        }
         if let Some(since) = self.dirty_since {
             let wait = SAVE_DELAY.saturating_sub(since.elapsed());
             if wait.is_zero() {
@@ -1308,6 +1554,7 @@ impl eframe::App for App {
             actions.extend(self.filmstrip(ui));
             actions.extend(self.scene_list(ui));
         });
+        self.export_window(&ui.ctx().clone());
 
         for action in actions {
             self.apply(action);
@@ -1363,6 +1610,18 @@ fn scaled_height(info: &VideoInfo, width: u32) -> u32 {
     ((width as f64 * info.height as f64 / info.width as f64).round() as u32 / 2 * 2).max(2)
 }
 
+/// Opens `dir` in the system's file manager.
+fn show_folder(dir: &Path) {
+    let program = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(program).arg(dir).spawn();
+}
+
 fn default_out_dir(input: &Path) -> PathBuf {
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
     input.parent().unwrap_or(Path::new(".")).join(format!("{stem}_scenes"))
@@ -1386,6 +1645,19 @@ impl App {
     /// (start, end, locked) of each section.
     pub(crate) fn section_ranges(&self) -> Vec<(usize, usize, bool)> {
         self.edits.sections.list.iter().map(|s| (s.start, s.end, s.lock.is_some())).collect()
+    }
+
+    pub(crate) fn out_dir(&self) -> Option<&Path> {
+        self.out_dir.as_deref()
+    }
+
+    /// The finished export's summary, or `None` while exporting or before the first.
+    pub(crate) fn export_summary(&self) -> Option<String> {
+        self.export_run.as_ref().filter(|r| r.finished).map(|r| r.summary())
+    }
+
+    pub(crate) fn cut_list_for_test(&self, format: cutlist::Format) -> String {
+        self.cut_list(format)
     }
 }
 

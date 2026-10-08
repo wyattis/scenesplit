@@ -546,4 +546,30 @@ fn app_buttons_and_keys_edit_the_cuts() {
     h.run_steps(2);
     assert!(h.state().section_ranges().is_empty());
     assert!(h.query_by_label("🔒 Lock").is_none(), "back to editing the whole video");
+
+    let edl = h.state().cut_list_for_test(crate::cutlist::Format::Edl);
+    assert!(edl.contains("\r\n001  AX       V     C        00:00:00:00 00:00:03:00 01:00:00:00 01:00:03:00\r\n"), "{edl}");
+    assert!(edl.contains("\r\n003  AX"), "{edl}");
+
+    // Export, and wait for every file.
+    h.get_by_label("⚙ Options").click();
+    h.run_steps(2);
+    h.get_by_label("e.g. input-001.mp4");
+    h.get_by_label("Export 3 scenes").click();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while h.state().export_summary().is_none() {
+        assert!(Instant::now() < deadline, "export timed out");
+        std::thread::sleep(Duration::from_millis(10));
+        h.step();
+    }
+    h.run_steps(2);
+    assert_eq!(h.state().export_summary().as_deref(), Some("Exported 3 of 3 files."));
+    let dir = h.state().out_dir().unwrap().to_owned();
+    for name in ["input-001.mp4", "input-002.png", "input-003.mp4"] {
+        assert!(dir.join(name).exists(), "{name}");
+        h.get_by_label(name);
+    }
+    h.get_by_label("Close").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("🗁 Show folder").is_none(), "window closed");
 }
