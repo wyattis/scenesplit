@@ -3,8 +3,8 @@
 Desktop app (Rust + egui) that splits a video made of multiple clips into separate
 clips, exporting static scenes as single PNG images.
 
-Uses `ffmpeg` and `ffprobe`: release archives include them next to the executable, which
-the app checks first; otherwise they need to be on `PATH`. The app shows a warning at
+Uses `ffmpeg` and `ffprobe`: the `with-ffmpeg` release archives include them next to the
+executable, which the app checks first; otherwise they need to be on `PATH`. The app shows a warning at
 startup if it can't find them.
 
 ```
@@ -15,7 +15,8 @@ cargo test -- --include-ignored # plus end-to-end tests that run ffmpeg
 
 UI tests (`src/ui_tests.rs`) use `egui_kittest` to drive the widgets with real mouse and
 keyboard input: dragging cut markers, snapping, the right-click menu, zooming, the
-overview bar, the filmstrip, shortcuts, and a whole-app run that clicks real buttons.
+overview and sections bars, the filmstrip, shortcuts, and a whole-app run that clicks real
+buttons.
 
 ## How it works
 
@@ -49,16 +50,26 @@ overview bar, the filmstrip, shortcuts, and a whole-app run that clicks real but
    | [ ] | previous / next cut |
    | Esc | deselect cut |
    | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | undo, redo |
-5. **Export** (`export.rs`): clips via ffmpeg (exact re-encode or fast stream copy),
+   | Shift+click a scene | select a range of scenes |
+5. **Sections** (`sections.rs`): give part of the video its own settings. Select scenes
+   (Shift+click for a range) and press "New section"; the settings panel then edits that
+   section, and the settings it changes are highlighted (↺ goes back to the whole-video
+   value). Other settings still follow the whole video. Sections show as a bar above the
+   scene overview: click one to edit it, drag an edge to resize (snaps to cuts). **Lock**
+   freezes a section's settings and detected cuts so later changes elsewhere can't affect
+   it. Detected cuts and scenes use the settings of the section they start in.
+6. **Export** (`export.rs`): clips via ffmpeg (exact re-encode or fast stream copy),
    stills as PNG of the scene's middle frame.
 
 ## Releases
 
 `.github/workflows/release.yml` builds x86_64 binaries for Windows, Linux and macOS.
 
-- Each archive includes static GPL builds of `ffmpeg`/`ffprobe` 9.0 (BtbN builds for
-  Windows/Linux, evermeet.cx for macOS) plus `THIRD-PARTY-NOTICES.md` and the GPL text.
-  CI runs the full test suite, including the ffmpeg end-to-end tests, against them.
+- Each platform gets two archives. `…-with-ffmpeg` includes static GPL builds of
+  `ffmpeg`/`ffprobe` 9.0 (BtbN builds for Windows/Linux, evermeet.cx for macOS) plus
+  `THIRD-PARTY-NOTICES.md` and the GPL text. `…-no-ffmpeg` is the app alone, for people
+  who already have ffmpeg on `PATH`. CI runs the full test suite, including the ffmpeg
+  end-to-end tests, against the bundled builds.
 - Push a tag like `v0.1.0` to build and publish a GitHub Release with the archives attached.
 - Or run the workflow manually (Actions → Build → Run workflow) to get the archives as
   run artifacts without creating a release.

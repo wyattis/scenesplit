@@ -10,9 +10,10 @@ use eframe::egui::{self, Event, Key, Modifiers, MouseWheelUnit, PointerButton, P
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
-use crate::editor::{self, Action, EditorView, GraphInput, OverviewInput, StripInput};
+use crate::editor::{self, Action, EditorView, GraphInput, OverviewInput, SectionsInput, StripInput};
 use crate::project::Edits;
 use crate::scenes::{self, CutEdits, CutId, Params, ResolvedCuts};
+use crate::sections::{Lock, Sections};
 
 const WIDTH: f32 = 1000.0;
 /// 201 frames over 1000px: 5px per frame when zoomed out.
@@ -83,7 +84,8 @@ fn graph_harness(edits: CutEdits) -> Harness<'static, GraphState> {
                     fps: 25.0,
                     playhead: 0,
                     selected_cut: None,
-                    threshold: 8.0,
+                    thresholds: vec![(0..FRAMES, Some(8.0))],
+                    sections: Vec::new(),
                 };
                 let actions = editor::graph(ui, &mut s.view, &input);
                 s.actions.extend(actions);
@@ -302,6 +304,19 @@ fn clicking_the_overview_selects_the_clip_under_the_pointer() {
 }
 
 #[test]
+fn shift_clicking_the_overview_extends_the_selection() {
+    let mut h = overview_harness();
+    h.state_mut().actions.clear();
+    let pos = overview_pos(h.state(), 130.0);
+    h.hover_at(pos);
+    h.event(Event::ModifiersChanged(Modifiers::SHIFT));
+    h.event(Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::SHIFT });
+    h.event(Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::SHIFT });
+    h.step();
+    assert_eq!(h.state().actions, [Action::ExtendSelection(2)]);
+}
+
+#[test]
 fn dragging_the_overview_scrubs_without_selecting() {
     let mut h = overview_harness();
     h.state_mut().actions.clear();
@@ -310,6 +325,75 @@ fn dragging_the_overview_scrubs_without_selecting() {
     let actions = &h.state().actions;
     assert!(actions.iter().all(|a| matches!(a, Action::Seek(_))), "{actions:?}");
     assert!(actions.contains(&Action::Seek(60)));
+}
+
+// ---- sections bar --------------------------------------------------------------------------
+
+struct SectionsState {
+    sections: Sections,
+    view: EditorView,
+    actions: Vec<Action>,
+    origin: Pos2,
+    width: f32,
+}
+
+/// Section A over frames 30..60 and a locked section B over 120..160. Cuts at 50 and 120.
+fn sections_harness() -> (Harness<'static, SectionsState>, u32, u32) {
+    let mut sections = Sections::default();
+    let a = sections.add(30..60).unwrap();
+    let b = sections.add(120..160).unwrap();
+    sections.get_mut(b).unwrap().lock = Some(Lock { params: Params::default(), cuts: Default::default() });
+    let state = SectionsState { sections, view: EditorView::new(FRAMES), actions: Vec::new(), origin: Pos2::ZERO, width: 0.0 };
+    let mut h = Harness::builder().with_size(vec2(WIDTH, 100.0)).with_step_dt(0.01).build_ui_state(
+        |ui, s: &mut SectionsState| {
+            s.origin = ui.cursor().min;
+            s.width = ui.available_width();
+            let input = SectionsInput { sections: &s.sections, selected: None, frame_count: FRAMES, fps: 25.0, snap_to: &[50, 120] };
+            let actions = editor::sections_bar(ui, &input, &mut s.view);
+            s.actions.extend(actions);
+        },
+        state,
+    );
+    h.state_mut().actions.clear();
+    (h, a, b)
+}
+
+fn sections_pos(s: &SectionsState, frame: f32) -> Pos2 {
+    pos2(s.origin.x + frame / FRAMES as f32 * s.width, s.origin.y + editor::SECTIONS_HEIGHT / 2.0)
+}
+
+#[test]
+fn clicking_a_section_selects_it_and_empty_space_selects_the_whole_video() {
+    let (mut h, a, b) = sections_harness();
+    for (frame, expected) in [(45.0, Some(a)), (140.0, Some(b)), (90.0, None)] {
+        let pos = sections_pos(h.state(), frame);
+        click_at(&mut h, pos);
+        assert_eq!(std::mem::take(&mut h.state_mut().actions), [Action::SelectSection(expected)], "frame {frame}");
+    }
+}
+
+#[test]
+fn dragging_a_section_edge_resizes_it_snapping_to_cuts() {
+    let (mut h, a, _) = sections_harness();
+    // End edge 60 → about 52, within snapping distance of the cut at 50.
+    let (from, to) = (sections_pos(h.state(), 60.0), sections_pos(h.state(), 51.6));
+    drag(&mut h, from, to, Modifiers::NONE);
+    let actions = std::mem::take(&mut h.state_mut().actions);
+    assert_eq!(&actions[..2], [Action::Checkpoint, Action::SelectSection(Some(a))], "one undo step per drag");
+    assert_eq!(actions.last(), Some(&Action::SetSectionRange { id: a, start: 30, end: 50 }));
+
+    drag(&mut h, from, to, Modifiers::ALT);
+    let actions = std::mem::take(&mut h.state_mut().actions);
+    assert_eq!(actions.last(), Some(&Action::SetSectionRange { id: a, start: 30, end: 52 }));
+}
+
+#[test]
+fn locked_sections_cant_be_resized() {
+    let (mut h, _, _) = sections_harness();
+    let (from, to) = (sections_pos(h.state(), 160.0), sections_pos(h.state(), 180.0));
+    drag(&mut h, from, to, Modifiers::NONE);
+    let actions = &h.state().actions;
+    assert!(!actions.iter().any(|a| matches!(a, Action::SetSectionRange { .. } | Action::Checkpoint)), "{actions:?}");
 }
 
 // ---- filmstrip ---------------------------------------------------------------------------
@@ -446,4 +530,19 @@ fn app_buttons_and_keys_edit_the_cuts() {
     h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
     h.run_steps(2);
     assert_eq!(h.state().cut_frames(), [75, 150]);
+
+    // Sections: select the middle scene, make it a section, lock it, remove it.
+    h.get_all_by_label("▶ Preview").nth(1).unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("➕ New section").click();
+    h.run_steps(2);
+    assert_eq!(h.state().section_ranges(), [(75, 150, false)]);
+    h.get_by_label("🔒 Lock").click();
+    h.run_steps(2);
+    assert_eq!(h.state().section_ranges(), [(75, 150, true)]);
+    h.get_by_label("🔒 Section 1");
+    h.get_by_label("🗑 Remove section").click();
+    h.run_steps(2);
+    assert!(h.state().section_ranges().is_empty());
+    assert!(h.query_by_label("🔒 Lock").is_none(), "back to editing the whole video");
 }

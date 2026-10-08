@@ -10,6 +10,7 @@ mod ffmpeg;
 mod player;
 mod project;
 mod scenes;
+mod sections;
 #[cfg(test)]
 mod ui_tests;
 

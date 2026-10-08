@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +18,8 @@ use crate::export::{self, CutMode, ExportItem};
 use crate::ffmpeg::{self, VideoInfo};
 use crate::player::Player;
 use crate::project::{self, Edits, History, Project};
-use crate::scenes::{self, CutEdits, CutId, CutSource, DetectMode, Params, ResolvedCuts, Scene, SceneKind};
+use crate::scenes::{self, CutEdits, CutId, CutSource, DetectMode, Detected, Params, ResolvedCuts, Scene, SceneKind};
+use crate::sections::{self, Lock, Section, Span};
 
 const THUMB_W: u32 = 192;
 const STRIP_W: u32 = 160;
@@ -63,8 +65,10 @@ struct Loaded {
     path: PathBuf,
     info: VideoInfo,
     analysis: Analysis,
+    /// Which settings apply where.
+    spans: Vec<Span>,
     /// Cuts found by detection, before the user's edits.
-    detected: Vec<usize>,
+    detected: Vec<Detected>,
     cuts: ResolvedCuts,
     scenes: Vec<Scene>,
     frame_tx: Sender<FrameJob>,
@@ -105,6 +109,10 @@ pub struct App {
 
     /// `Scene::id` of the selected scene.
     selected: Option<CutId>,
+    /// Other end of a range of selected scenes (Shift+click).
+    selected_to: Option<CutId>,
+    /// Section whose settings the settings panel edits (`None`: the whole video).
+    selected_section: Option<u32>,
     selected_cut: Option<CutId>,
     loop_scene: bool,
     view: EditorView,
@@ -152,6 +160,8 @@ impl App {
             dirty_since: None,
             save_blocked: false,
             selected: None,
+            selected_to: None,
+            selected_section: None,
             selected_cut: None,
             loop_scene: true,
             view: EditorView::new(1),
@@ -182,6 +192,8 @@ impl App {
         self.generation += 1;
         self.loaded = None;
         self.selected = None;
+        self.selected_to = None;
+        self.selected_section = None;
         self.selected_cut = None;
         self.thumbs.clear();
         self.thumbs_requested.clear();
@@ -248,6 +260,7 @@ impl App {
             path,
             info,
             analysis,
+            spans: Vec::new(),
             detected: Vec::new(),
             cuts: ResolvedCuts::default(),
             scenes: Vec::new(),
@@ -261,11 +274,18 @@ impl App {
     fn recompute(&mut self) {
         let Some(l) = &mut self.loaded else { return };
         let fc = l.frame_count();
-        l.detected = scenes::detect_cuts(&l.analysis.diffs, l.analysis.fps, &self.params);
-        l.cuts = scenes::resolve_cuts(&l.detected, &self.edits.cuts, fc, self.params.cut_offset);
-        l.scenes = scenes::build_scenes(&l.analysis.diffs, fc, &l.cuts.cuts, &self.params);
+        l.spans = sections::plan(&self.params, &self.edits.sections, fc);
+        l.detected = scenes::detect(&l.analysis.diffs, l.analysis.fps, &l.spans);
+        l.cuts = scenes::resolve(&l.detected, &self.edits.cuts, fc);
+        l.scenes = scenes::build(&l.analysis.diffs, fc, &l.cuts.cuts, &l.spans);
         if self.selected.is_some_and(|id| !l.scenes.iter().any(|s| s.id == id)) {
             self.selected = None;
+        }
+        if self.selected.is_none() || self.selected_to.is_some_and(|id| !l.scenes.iter().any(|s| s.id == id)) {
+            self.selected_to = None;
+        }
+        if self.selected_section.is_some_and(|id| self.edits.sections.get(id).is_none()) {
+            self.selected_section = None;
         }
         if self.selected_cut.is_some_and(|id| l.cuts.get(id).is_none()) {
             self.selected_cut = None;
@@ -297,14 +317,21 @@ impl App {
         self.mark_dirty();
     }
 
-    /// Keep the player's loop range on the selected scene's exported frames.
+    /// Indices of the selected scenes.
+    fn selection(&self) -> Option<RangeInclusive<usize>> {
+        let l = self.loaded.as_ref()?;
+        let index = |id: CutId| l.scenes.iter().position(|s| s.id == id);
+        let a = index(self.selected?)?;
+        let b = self.selected_to.and_then(index).unwrap_or(a);
+        Some(a.min(b)..=a.max(b))
+    }
+
+    /// Keep the player's loop range on the selected scenes' exported frames.
     fn sync_loop_range(&mut self) {
+        let selection = self.selection().filter(|_| self.loop_scene);
         let Some(l) = &mut self.loaded else { return };
-        l.player.loop_range = self
-            .selected
-            .filter(|_| self.loop_scene)
-            .and_then(|id| l.scenes.iter().find(|s| s.id == id))
-            .map(|s| s.keep.clone())
+        l.player.loop_range = selection
+            .map(|r| l.scenes[*r.start()].keep.start..l.scenes[*r.end()].keep.end)
             .filter(|r| !r.is_empty());
     }
 
@@ -349,6 +376,7 @@ impl App {
                 let Some(scene) = l.scenes.get(index) else { return };
                 let (id, frame) = (scene.id, if scene.keep.is_empty() { scene.start } else { scene.keep.start });
                 self.selected = Some(id);
+                self.selected_to = None;
                 self.scroll_to_scene = Some(index);
                 self.sync_loop_range();
                 let player = &mut self.loaded.as_mut().unwrap().player;
@@ -360,9 +388,20 @@ impl App {
             Action::SelectSceneAt { index, frame } => {
                 let Some(scene) = l.scenes.get(index) else { return };
                 self.selected = Some(scene.id);
+                self.selected_to = None;
                 self.scroll_to_scene = Some(index);
                 self.sync_loop_range();
                 self.loaded.as_mut().unwrap().player.seek(frame);
+            }
+            Action::ExtendSelection(index) => {
+                let Some(scene) = l.scenes.get(index) else { return };
+                if self.selected.is_none() {
+                    self.selected = Some(scene.id);
+                } else {
+                    self.selected_to = Some(scene.id);
+                }
+                self.scroll_to_scene = Some(index);
+                self.sync_loop_range();
             }
             Action::SelectCut(id) => self.selected_cut = id,
             Action::Checkpoint => self.history.checkpoint(&self.edits, None),
@@ -431,8 +470,9 @@ impl App {
                 }
             }
             Action::ZoomToSelectedScene => {
-                if let Some(s) = self.selected.and_then(|id| l.scenes.iter().find(|s| s.id == id)) {
-                    self.view.show_range(s.start..s.end);
+                if let Some(r) = self.selection() {
+                    let l = self.loaded.as_ref().unwrap();
+                    self.view.show_range(l.scenes[*r.start()].start..l.scenes[*r.end()].end);
                 }
             }
             Action::SetKind(id, kind) => self.edit(None, |e| {
@@ -445,6 +485,53 @@ impl App {
                     e.excluded.remove(&id);
                 }
             }),
+            Action::SelectSection(id) => self.selected_section = id,
+            Action::NewSection => {
+                let Some(r) = self.selection() else {
+                    self.notify("Select scenes first: click one, then Shift+click another to select a range.");
+                    return;
+                };
+                let l = self.loaded.as_ref().unwrap();
+                let mut sections = self.edits.sections.clone();
+                match sections.add(l.scenes[*r.start()].start..l.scenes[*r.end()].end) {
+                    Ok(id) => {
+                        self.edit(None, |e| e.sections = sections);
+                        self.selected_section = Some(id);
+                    }
+                    Err(e) => self.notify(e),
+                }
+            }
+            Action::DeleteSection(id) => self.edit(None, |e| e.sections.remove(id)),
+            Action::SetSectionRange { id, start, end } => {
+                let fc = l.frame_count();
+                let Some(section) = self.edits.sections.get(id).filter(|s| s.lock.is_none()) else { return };
+                if (section.start, section.end) != (start, end) {
+                    self.edits.sections.set_range(id, start..end, fc);
+                    self.recompute();
+                    self.mark_dirty();
+                }
+            }
+            Action::ToggleLock(id) => {
+                let Some(section) = self.edits.sections.get(id) else { return };
+                let lock = match section.lock {
+                    Some(_) => None,
+                    // Freeze what the section shows now: its settings and detected cuts.
+                    None => Some(Lock {
+                        params: section.overrides.apply(&self.params),
+                        cuts: l
+                            .detected
+                            .iter()
+                            .filter(|d| (section.start..section.end).contains(&d.id))
+                            .map(|d| (d.id, d.frame.max(0) as usize))
+                            .collect(),
+                    }),
+                };
+                self.edit(None, |e| {
+                    if let Some(s) = e.sections.get_mut(id) {
+                        s.lock = lock;
+                    }
+                });
+            }
         }
     }
 
@@ -605,63 +692,166 @@ impl App {
         });
     }
 
-    fn settings(&mut self, ui: &mut egui::Ui) {
-        let mut changed = false;
-        let p = &mut self.params;
-        ui.horizontal(|ui| {
-            ui.label("Cut detection:");
-            changed |= ui.radio_value(&mut p.mode, DetectMode::Adaptive, "Adaptive").changed();
-            changed |= ui.radio_value(&mut p.mode, DetectMode::Fixed, "Fixed threshold").changed();
+    /// Which settings the panel edits: the whole video or a section, plus section controls.
+    fn section_picker(&self, ui: &mut egui::Ui, section: Option<&Section>, actions: &mut Vec<Action>) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Settings for:");
+            if ui.selectable_label(section.is_none(), "Whole video").clicked() {
+                actions.push(Action::SelectSection(None));
+            }
+            for (i, s) in self.edits.sections.list.iter().enumerate() {
+                let text = format!("{}Section {}", if s.lock.is_some() { "🔒 " } else { "" }, i + 1);
+                let selected = section.is_some_and(|x| x.id == s.id);
+                if ui.selectable_label(selected, RichText::new(text).color(editor::SECTION_COLOR)).clicked() {
+                    actions.push(Action::SelectSection(Some(s.id)));
+                }
+            }
+            ui.separator();
+            if ui
+                .add_enabled(self.selection().is_some(), egui::Button::new("➕ New section"))
+                .on_hover_text("Give the selected scenes their own settings.\nShift+click scenes to select several.")
+                .clicked()
+            {
+                actions.push(Action::NewSection);
+            }
+            let Some(s) = section else {
+                if !self.edits.sections.list.is_empty() {
+                    ui.label(RichText::new("Sections keep the settings they change.").weak());
+                }
+                return;
+            };
+            let (text, hint) = match s.lock {
+                Some(_) => ("🔓 Unlock", "Let setting changes affect this section again."),
+                None => ("🔒 Lock", "Keep this section's cuts and settings as they are now,\nwhatever you change elsewhere."),
+            };
+            if ui.button(text).on_hover_text(hint).clicked() {
+                actions.push(Action::ToggleLock(s.id));
+            }
+            if ui.button("🗑 Remove section").on_hover_text("This part goes back to the whole-video settings.").clicked() {
+                actions.push(Action::DeleteSection(s.id));
+            }
+            let fps = self.loaded.as_ref().map_or(1.0, |l| l.analysis.fps);
+            let state = match (&s.lock, s.overrides.count()) {
+                (Some(_), _) => "locked: settings and detected cuts are frozen (cuts can still be edited by hand)".to_owned(),
+                (None, 0) => "same as the whole video until you change a setting".to_owned(),
+                (None, n) => format!("{n} settings changed, the rest follow the whole video"),
+            };
+            ui.label(RichText::new(format!("{} – {} · {state}", fmt_time(s.start as f64 / fps), fmt_time(s.end as f64 / fps))).weak());
         });
-        egui::Grid::new("settings").num_columns(4).spacing([16.0, 4.0]).show(ui, |ui| {
-            match p.mode {
-                DetectMode::Fixed => {
-                    ui.label("Cut threshold");
-                    changed |= ui.add(egui::Slider::new(&mut p.cut_threshold, 1.0..=120.0)).changed();
-                }
-                DetectMode::Adaptive => {
-                    ui.label("Sensitivity ratio");
-                    changed |= ui.add(egui::Slider::new(&mut p.adaptive_ratio, 1.2..=10.0)).changed();
-                }
-            }
-            ui.label("Min scene length (s)");
-            changed |= ui.add(egui::Slider::new(&mut p.min_scene_secs, 0.0..=5.0)).changed();
-            ui.end_row();
+    }
 
-            if p.mode == DetectMode::Adaptive {
-                ui.label("Ignore changes below");
-                changed |= ui.add(egui::Slider::new(&mut p.adaptive_floor, 0.0..=60.0)).changed();
-            } else {
-                ui.label("");
-                ui.label("");
-            }
-            ui.label("Still if motion below")
-                .on_hover_text("Scenes whose median frame-to-frame change is below this are exported as a single image.");
-            changed |= ui.add(egui::Slider::new(&mut p.still_threshold, 0.0..=10.0)).changed();
-            ui.end_row();
+    fn settings(&mut self, ui: &mut egui::Ui) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let section = self.selected_section.and_then(|id| self.edits.sections.get(id)).cloned();
+        self.section_picker(ui, section.as_ref(), &mut actions);
 
-            ui.label("Cut offset (frames)").on_hover_text(
-                "Moves every detected cut relative to the detected change.\n\
-                 0: the new scene starts on the first changed frame.\n\
-                 Negative: earlier. Positive: later.\n\
-                 Cuts you moved or added by hand aren't affected.",
-            );
-            changed |= ui.add(egui::DragValue::new(&mut p.cut_offset).range(-60..=60).speed(0.1)).changed();
-            ui.label("Drop frames before / after cut").on_hover_text(
-                "Frames removed from the end of the outgoing scene and the start of the incoming one, \
-                 e.g. to skip transition or blended frames. Not applied at the start or end of the video.",
-            );
+        let locked = section.as_ref().is_some_and(|s| s.lock.is_some());
+        let before = match &section {
+            Some(Section { lock: Some(lock), .. }) => lock.params.clone(),
+            Some(s) => s.overrides.apply(&self.params),
+            None => self.params.clone(),
+        };
+        let mut p = before.clone();
+        let mut cleared = Vec::new();
+        // Settings the section overrides are highlighted, with a button to go back to the whole-video value.
+        let overridden = |name: &str| section.as_ref().is_some_and(|s| !locked && s.overrides.is_set(name));
+        let mut label = |ui: &mut egui::Ui, name: &'static str, text: &str| -> egui::Response {
+            if !overridden(name) {
+                return ui.label(text);
+            }
             ui.horizontal(|ui| {
-                changed |= ui.add(egui::DragValue::new(&mut p.drop_before_cut).range(0..=600).speed(0.1)).changed();
-                ui.label("/");
-                changed |= ui.add(egui::DragValue::new(&mut p.drop_after_cut).range(0..=600).speed(0.1)).changed();
+                if ui.small_button("↺").on_hover_text("Use the whole-video setting").clicked() {
+                    cleared.push(name);
+                }
+                ui.label(RichText::new(text).color(editor::SECTION_COLOR));
+            })
+            .response
+        };
+
+        ui.add_enabled_ui(!locked, |ui| {
+            ui.horizontal(|ui| {
+                label(ui, "mode", "Cut detection:");
+                ui.radio_value(&mut p.mode, DetectMode::Adaptive, "Adaptive");
+                ui.radio_value(&mut p.mode, DetectMode::Fixed, "Fixed threshold");
             });
-            ui.end_row();
+            egui::Grid::new("settings").num_columns(4).spacing([16.0, 4.0]).show(ui, |ui| {
+                match p.mode {
+                    DetectMode::Fixed => {
+                        label(ui, "cut_threshold", "Cut threshold");
+                        ui.add(egui::Slider::new(&mut p.cut_threshold, 1.0..=120.0));
+                    }
+                    DetectMode::Adaptive => {
+                        label(ui, "adaptive_ratio", "Sensitivity ratio");
+                        ui.add(egui::Slider::new(&mut p.adaptive_ratio, 1.2..=10.0));
+                    }
+                }
+                label(ui, "min_scene_secs", "Min scene length (s)");
+                ui.add(egui::Slider::new(&mut p.min_scene_secs, 0.0..=5.0));
+                ui.end_row();
+
+                if p.mode == DetectMode::Adaptive {
+                    label(ui, "adaptive_floor", "Ignore changes below");
+                    ui.add(egui::Slider::new(&mut p.adaptive_floor, 0.0..=60.0));
+                } else {
+                    ui.label("");
+                    ui.label("");
+                }
+                label(ui, "still_threshold", "Still if motion below")
+                    .on_hover_text("Scenes whose median frame-to-frame change is below this are exported as a single image.");
+                ui.add(egui::Slider::new(&mut p.still_threshold, 0.0..=10.0));
+                ui.end_row();
+
+                label(ui, "cut_offset", "Cut offset (frames)").on_hover_text(
+                    "Moves every detected cut relative to the detected change.\n\
+                     0: the new scene starts on the first changed frame.\n\
+                     Negative: earlier. Positive: later.\n\
+                     Cuts you moved or added by hand aren't affected.",
+                );
+                ui.add(egui::DragValue::new(&mut p.cut_offset).range(-60..=60).speed(0.1));
+                // One label for both values: overriding either highlights it.
+                let name = if overridden("drop_after_cut") { "drop_after_cut" } else { "drop_before_cut" };
+                label(ui, name, "Drop frames before / after cut").on_hover_text(
+                    "Frames removed from the end of the outgoing scene and the start of the incoming one, \
+                     e.g. to skip transition or blended frames. Not applied at the start or end of the video.",
+                );
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut p.drop_before_cut).range(0..=600).speed(0.1));
+                    ui.label("/");
+                    ui.add(egui::DragValue::new(&mut p.drop_after_cut).range(0..=600).speed(0.1));
+                });
+                ui.end_row();
+            });
         });
-        if changed {
-            self.recompute();
-            self.mark_dirty();
+        // The drop label resets both values.
+        if cleared.contains(&"drop_before_cut") || cleared.contains(&"drop_after_cut") {
+            cleared.extend(["drop_before_cut", "drop_after_cut"]);
         }
+
+        match section {
+            None if p != before => {
+                self.params = p;
+                self.recompute();
+                self.mark_dirty();
+            }
+            Some(s) if !locked => {
+                let mut overrides = s.overrides.clone();
+                let changed = overrides.record(&before, &p);
+                for name in cleared {
+                    overrides.clear(name);
+                }
+                if overrides != s.overrides {
+                    // Dragging one slider is one undo step.
+                    let key = changed.map(|name| format!("section {} {name}", s.id));
+                    self.edit(key, |e| {
+                        if let Some(x) = e.sections.get_mut(s.id) {
+                            x.overrides = overrides;
+                        }
+                    });
+                }
+            }
+            _ => {}
+        }
+        actions
     }
 
     fn cut_editor(&mut self, ui: &mut egui::Ui) -> Vec<Action> {
@@ -673,10 +863,22 @@ impl App {
             fps: l.analysis.fps,
             playhead: l.player.position(),
             selected_cut: self.selected_cut,
-            threshold: match self.params.mode {
-                DetectMode::Fixed => self.params.cut_threshold,
-                DetectMode::Adaptive => self.params.adaptive_floor,
-            },
+            thresholds: l
+                .spans
+                .iter()
+                .map(|s| {
+                    let t = match s.params.mode {
+                        DetectMode::Fixed => s.params.cut_threshold,
+                        DetectMode::Adaptive => s.params.adaptive_floor,
+                    };
+                    (s.range.clone(), s.frozen.is_none().then_some(t))
+                })
+                .collect(),
+            sections: l
+                .spans
+                .iter()
+                .filter_map(|s| Some((s.range.clone(), s.section? == self.selected_section.unwrap_or(u32::MAX))))
+                .collect(),
         };
         let mut actions = editor::graph(ui, &mut self.view, &input);
 
@@ -752,10 +954,20 @@ impl App {
             }
         }
 
+        let snap_to: Vec<usize> = l.cuts.cuts.iter().map(|c| c.frame).collect();
+        let bar = editor::SectionsInput {
+            sections: &self.edits.sections,
+            selected: self.selected_section,
+            frame_count: l.frame_count(),
+            fps: l.analysis.fps,
+            snap_to: &snap_to,
+        };
+        actions.extend(editor::sections_bar(ui, &bar, &mut self.view));
+
         let overview = editor::OverviewInput {
             scenes: &l.scenes,
             edits: &self.edits,
-            selected: self.selected,
+            selected: self.selection(),
             frame_count: l.player.frame_count(),
             fps: l.analysis.fps,
             shown_frame: l.player.current_frame(),
@@ -830,6 +1042,7 @@ impl App {
         // Every row is exactly ROW_HEIGHT tall (its separator included), so a row's scroll
         // offset is exact and selecting a scene elsewhere can bring it into view.
         let pitch = ROW_HEIGHT + ui.spacing().item_spacing.y;
+        let selection = self.selection();
         let mut area = egui::ScrollArea::vertical().auto_shrink(false);
         if let Some(i) = self.scroll_to_scene.take().filter(|i| !self.visible_rows.contains(i)) {
             area = area.vertical_scroll_offset((i as f32 - 1.0).max(0.0) * pitch);
@@ -844,7 +1057,7 @@ impl App {
                 if self.thumbs_requested.insert(thumb_frame) {
                     let _ = l.frame_tx.send(FrameJob { kind: FrameKind::Thumb, start: thumb_frame, count: 1 });
                 }
-                let is_selected = self.selected == Some(scene.id);
+                let is_selected = selection.as_ref().is_some_and(|r| r.contains(&i));
                 let background = ui.painter().add(Shape::Noop);
 
                 let row = ui.horizontal(|ui| {
@@ -859,8 +1072,12 @@ impl App {
                             resp
                         }
                     };
-                    if thumb.on_hover_text("Click to preview").clicked() {
-                        actions.push(Action::SelectScene { index: i, play: true });
+                    if thumb.on_hover_text("Click to preview, Shift+click to select a range").clicked() {
+                        actions.push(if ui.input(|i| i.modifiers.shift) {
+                            Action::ExtendSelection(i)
+                        } else {
+                            Action::SelectScene { index: i, play: true }
+                        });
                     }
 
                     ui.vertical(|ui| {
@@ -881,6 +1098,10 @@ impl App {
                                     ui.label(RichText::new("✂ manual cut").small().color(editor::MANUAL_COLOR));
                                 }
                                 _ => {}
+                            }
+                            let section = l.spans.first().and_then(|_| sections::span_at(&l.spans, scene.start).section);
+                            if let Some(n) = section.and_then(|id| self.edits.sections.number(id)) {
+                                ui.label(RichText::new(format!("section {n}")).small().color(editor::SECTION_COLOR));
                             }
                         });
                         ui.label(
@@ -965,7 +1186,7 @@ impl eframe::App for App {
         });
         egui::Panel::top("settings").show(ui, |ui| {
             ui.add_space(4.0);
-            self.settings(ui);
+            actions.extend(self.settings(ui));
             actions.extend(self.cut_editor(ui));
             ui.add_space(4.0);
         });
@@ -1056,6 +1277,11 @@ impl App {
     pub(crate) fn cut_frames(&self) -> Vec<usize> {
         self.loaded.as_ref().map_or(Vec::new(), |l| l.cuts.cuts.iter().map(|c| c.frame).collect())
     }
+
+    /// (start, end, locked) of each section.
+    pub(crate) fn section_ranges(&self) -> Vec<(usize, usize, bool)> {
+        self.edits.sections.list.iter().map(|s| (s.start, s.end, s.lock.is_some())).collect()
+    }
 }
 
 #[cfg(test)]
@@ -1145,6 +1371,58 @@ mod tests {
         // The second open skips decoding and gets the same scores.
         assert!(reopened.status.contains("analysis from cache"), "{}", reopened.status);
         assert_eq!(reopened.loaded.as_ref().unwrap().analysis.diffs, app.loaded.as_ref().unwrap().analysis.diffs);
+    }
+
+    /// Sections against a real video (cuts at 75 and 150): their own settings, locking, undo.
+    #[test]
+    #[ignore = "needs ffmpeg on PATH"]
+    fn sections_end_to_end() {
+        let input = ffmpeg::make_test_video("sections");
+        let _ = std::fs::remove_file(project::sidecar_path(&input));
+        let ctx = egui::Context::default();
+        let mut app = App::empty();
+        open_and_wait(&ctx, &mut app, &input);
+
+        app.apply(Action::NewSection);
+        assert!(app.edits.sections.list.is_empty() && app.notice.is_some(), "needs selected scenes");
+
+        // Shift+click selects scenes 1..=2; a section over them.
+        app.apply(Action::SelectScene { index: 1, play: false });
+        app.apply(Action::ExtendSelection(2));
+        assert_eq!(app.selection(), Some(1..=2));
+        app.apply(Action::NewSection);
+        let id = app.selected_section.expect("new section is selected for editing");
+        assert_eq!(app.section_ranges(), [(75, 225, false)]);
+        app.apply(Action::NewSection);
+        assert_eq!(app.edits.sections.list.len(), 1, "overlapping sections are refused");
+
+        // Its own offset moves only its cuts; the whole-video offset still applies elsewhere.
+        app.edit(None, |e| e.sections.get_mut(id).unwrap().overrides.cut_offset = Some(3));
+        assert_eq!(cut_frames(&app), [(78, CutSource::Detected), (153, CutSource::Detected)]);
+        app.apply(Action::SetSectionRange { id, start: 100, end: 225 });
+        assert_eq!(cut_frames(&app), [(75, CutSource::Detected), (153, CutSource::Detected)]);
+
+        // Locked, it ignores whole-video changes that remove every other cut.
+        app.apply(Action::ToggleLock(id));
+        app.params = Params { mode: DetectMode::Fixed, cut_threshold: 255.0, ..app.params.clone() };
+        app.recompute();
+        assert_eq!(cut_frames(&app), [(153, CutSource::Detected)]);
+        app.apply(Action::SetSectionRange { id, start: 0, end: 225 });
+        assert_eq!(app.section_ranges(), [(100, 225, true)], "locked sections can't be resized");
+
+        // Unlocking lets the change through; undo locks it again.
+        app.apply(Action::ToggleLock(id));
+        assert_eq!(cut_frames(&app), []);
+        app.apply(Action::Undo);
+        assert_eq!(cut_frames(&app), [(153, CutSource::Detected)]);
+
+        // Saved and restored with the project.
+        app.save_project();
+        let mut reopened = App::empty();
+        open_and_wait(&ctx, &mut reopened, &input);
+        assert_eq!(reopened.edits.sections, app.edits.sections);
+        assert_eq!(cut_frames(&reopened), [(153, CutSource::Detected)]);
+        let _ = std::fs::remove_file(project::sidecar_path(&input));
     }
 
     fn open_and_wait(ctx: &egui::Context, app: &mut App, path: &Path) {

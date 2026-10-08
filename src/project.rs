@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::scenes::{CutEdits, CutId, Params, SceneKind};
+use crate::sections::Sections;
 
 /// The undoable part of the user's work.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -17,6 +18,8 @@ pub struct Edits {
     pub kinds: BTreeMap<CutId, SceneKind>,
     /// Scenes left out of the export.
     pub excluded: BTreeSet<CutId>,
+    /// Parts of the video with their own settings.
+    pub sections: Sections,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

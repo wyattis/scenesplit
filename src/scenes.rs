@@ -1,13 +1,16 @@
 //! Turning per-frame difference scores into scenes. Pure and cheap to re-run.
 //!
-//! The pipeline is: detected cuts (from the scores) + the user's [`CutEdits`] →
-//! [`resolve_cuts`] → [`build_scenes`].
+//! The pipeline is: [`sections::plan`] (which settings apply where) → [`detect`] →
+//! detected cuts + the user's [`CutEdits`] → [`resolve`] → [`build`]. The `*_cuts`/`build_scenes`
+//! functions are the same with one set of settings for the whole video.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
+
+use crate::sections::{self, Span};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DetectMode {
@@ -239,26 +242,61 @@ impl Scene {
     }
 }
 
-/// Frame indices where a new scene starts (never includes 0).
-pub fn detect_cuts(diffs: &[f32], fps: f64, p: &Params) -> Vec<usize> {
-    let min_frames = ((p.min_scene_secs as f64 * fps).round() as usize).max(1);
-    let mut cuts = Vec::new();
-    let mut last_cut = 0usize;
+/// A cut found by detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Detected {
+    /// The frame detection placed it at; its identity ([`CutId::Detected`]).
+    pub id: usize,
+    /// Where it goes after the cut offset (not yet clamped to the video).
+    pub frame: i64,
+}
 
-    for (i, &d) in diffs.iter().enumerate() {
+/// Frame indices where a new scene starts (never includes 0), with one set of settings.
+#[cfg(test)]
+pub fn detect_cuts(diffs: &[f32], fps: f64, p: &Params) -> Vec<usize> {
+    let mut cuts = Vec::new();
+    detect_range(diffs, fps, p, 1..diffs.len() + 1, &mut 0, &mut cuts);
+    cuts
+}
+
+/// Detected cuts, each span using its own settings. Locked spans use their frozen cuts.
+pub fn detect(diffs: &[f32], fps: f64, spans: &[Span]) -> Vec<Detected> {
+    let mut out = Vec::new();
+    let mut last_cut = 0;
+    for span in spans {
+        let found: Vec<(usize, i64)> = match &span.frozen {
+            Some(frozen) => frozen.range(span.range.clone()).map(|(&id, &frame)| (id, frame as i64)).collect(),
+            None => {
+                let mut cuts = Vec::new();
+                detect_range(diffs, fps, &span.params, span.range.start.max(1)..span.range.end, &mut last_cut, &mut cuts);
+                cuts.into_iter().map(|id| (id, id as i64 + span.params.cut_offset as i64)).collect()
+            }
+        };
+        if let Some(&(id, _)) = found.last() {
+            last_cut = id;
+        }
+        out.extend(found.into_iter().map(|(id, frame)| Detected { id, frame }));
+    }
+    out
+}
+
+/// Detects cuts on `frames` (a cut on frame `f` comes from `diffs[f - 1]`). `last_cut` carries
+/// the minimum scene length across calls.
+fn detect_range(diffs: &[f32], fps: f64, p: &Params, frames: Range<usize>, last_cut: &mut usize, out: &mut Vec<usize>) {
+    let min_frames = ((p.min_scene_secs as f64 * fps).round() as usize).max(1);
+    for frame in frames {
+        let Some(&d) = diffs.get(frame - 1) else { break };
         let is_cut = match p.mode {
             DetectMode::Fixed => d >= p.cut_threshold,
             DetectMode::Adaptive => {
-                d >= p.adaptive_floor && d >= p.adaptive_ratio * neighbour_mean(diffs, i, p.adaptive_window)
+                d >= p.adaptive_floor && d >= p.adaptive_ratio * neighbour_mean(diffs, frame - 1, p.adaptive_window)
             }
         };
-        let frame = i + 1;
-        if is_cut && frame - last_cut >= min_frames {
-            cuts.push(frame);
-            last_cut = frame;
+        if is_cut && frame - *last_cut >= min_frames {
+            out.push(frame);
+            *last_cut = frame;
         }
     }
-    cuts
 }
 
 fn neighbour_mean(diffs: &[f32], i: usize, window: usize) -> f32 {
@@ -270,8 +308,15 @@ fn neighbour_mean(diffs: &[f32], i: usize, window: usize) -> f32 {
     if n == 0 { 0.0 } else { sum / n as f32 }
 }
 
-/// Combine detected cuts with the user's edits into the final, sorted list of cuts.
+/// [`resolve`] for cuts detected with one set of settings.
+#[cfg(test)]
 pub fn resolve_cuts(detected: &[usize], edits: &CutEdits, frame_count: usize, offset: i32) -> ResolvedCuts {
+    let detected: Vec<Detected> = detected.iter().map(|&id| Detected { id, frame: id as i64 + offset as i64 }).collect();
+    resolve(&detected, edits, frame_count)
+}
+
+/// Combine detected cuts with the user's edits into the final, sorted list of cuts.
+pub fn resolve(detected: &[Detected], edits: &CutEdits, frame_count: usize) -> ResolvedCuts {
     if frame_count < 2 {
         return ResolvedCuts::default();
     }
@@ -279,8 +324,8 @@ pub fn resolve_cuts(detected: &[usize], edits: &CutEdits, frame_count: usize, of
     let mut cuts = Vec::new();
     let mut removed = Vec::new();
 
-    for &d in detected {
-        let auto = clamp(d as i64 + offset as i64);
+    for &Detected { id: d, frame } in detected {
+        let auto = clamp(frame);
         if edits.removed.contains(&d) {
             removed.push(auto);
             continue;
@@ -292,7 +337,7 @@ pub fn resolve_cuts(detected: &[usize], edits: &CutEdits, frame_count: usize, of
     }
 
     // Moved cuts that detection no longer finds stay where the user put them.
-    let detected: HashSet<usize> = detected.iter().copied().collect();
+    let detected: HashSet<usize> = detected.iter().map(|d| d.id).collect();
     for (&d, &to) in &edits.moved {
         if !detected.contains(&d) && !edits.removed.contains(&d) {
             cuts.push(Cut { id: CutId::Detected(d), frame: clamp(to as i64), source: CutSource::Moved, ghost: None });
@@ -308,8 +353,15 @@ pub fn resolve_cuts(detected: &[usize], edits: &CutEdits, frame_count: usize, of
     ResolvedCuts { cuts, removed }
 }
 
-/// Split `0..frame_count` at `cuts`, drop frames around each cut, and classify each scene.
+/// [`build`] with one set of settings.
+#[cfg(test)]
 pub fn build_scenes(diffs: &[f32], frame_count: usize, cuts: &[Cut], p: &Params) -> Vec<Scene> {
+    build(diffs, frame_count, cuts, &sections::plan(p, &Default::default(), frame_count))
+}
+
+/// Split `0..frame_count` at `cuts`, drop frames around each cut, and classify each scene.
+/// Each scene uses the settings of the span it starts in.
+pub fn build(diffs: &[f32], frame_count: usize, cuts: &[Cut], spans: &[Span]) -> Vec<Scene> {
     let bounds: Vec<(CutId, usize)> = std::iter::once((CutId::Start, 0))
         .chain(cuts.iter().map(|c| (c.id, c.frame)).filter(|&(_, f)| f > 0 && f < frame_count))
         .chain(std::iter::once((CutId::Start, frame_count)))
@@ -319,6 +371,7 @@ pub fn build_scenes(diffs: &[f32], frame_count: usize, cuts: &[Cut], p: &Params)
         .windows(2)
         .map(|w| {
             let ((id, start), (_, end)) = (w[0], w[1]);
+            let p = &sections::span_at(spans, start).params;
             // Only trim at real cuts, not at the very start or end of the video. Dropping more
             // frames than the scene has leaves an empty range, clamped to stay inside the scene.
             let keep_start = if start == 0 { start } else { start.saturating_add(p.drop_after_cut).min(end) };
@@ -352,6 +405,7 @@ fn median(xs: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sections::{Lock, Sections};
 
     /// 10 frames of motion, a hard cut, 10 static frames, a hard cut, 10 frames of motion.
     fn sample() -> Vec<f32> {
@@ -492,6 +546,82 @@ mod tests {
         assert_eq!(json, r#"{"start":"Still","d42":"Video","m3":"Still"}"#);
         assert_eq!(serde_json::from_str::<BTreeMap<CutId, SceneKind>>(&json).unwrap(), map);
         assert!(serde_json::from_str::<CutId>(r#""x1""#).is_err());
+    }
+
+    fn bounds_with(sections: &Sections, global: &Params) -> Vec<(CutId, usize, usize)> {
+        let d = sample();
+        let spans = sections::plan(global, sections, d.len() + 1);
+        let detected = detect(&d, 10.0, &spans);
+        let resolved = resolve(&detected, &CutEdits::default(), d.len() + 1);
+        super::build(&d, d.len() + 1, &resolved.cuts, &spans).iter().map(|s| (s.id, s.start, s.end)).collect()
+    }
+
+    #[test]
+    fn sections_detect_with_their_own_settings() {
+        let global = Params { mode: DetectMode::Fixed, cut_threshold: 70.0, ..params(DetectMode::Fixed) };
+        // Globally only the 80 spike counts; a section with a lower threshold also finds the 60 one.
+        assert_eq!(bounds_with(&Sections::default(), &global), [(CutId::Start, 0, 10), (CutId::Detected(10), 10, 30)]);
+        let mut sections = Sections::default();
+        let id = sections.add(15..30).unwrap();
+        sections.get_mut(id).unwrap().overrides.cut_threshold = Some(50.0);
+        sections.get_mut(id).unwrap().overrides.cut_offset = Some(-1);
+        assert_eq!(
+            bounds_with(&sections, &global),
+            [(CutId::Start, 0, 10), (CutId::Detected(10), 10, 19), (CutId::Detected(20), 19, 30)],
+            "the offset only applies to the section's cut"
+        );
+    }
+
+    #[test]
+    fn scenes_use_the_settings_of_the_section_they_start_in() {
+        let d = sample();
+        let mut sections = Sections::default();
+        let id = sections.add(10..20).unwrap();
+        sections.get_mut(id).unwrap().overrides.drop_before_cut = Some(2);
+        sections.get_mut(id).unwrap().overrides.drop_after_cut = Some(1);
+        sections.get_mut(id).unwrap().overrides.still_threshold = Some(0.0);
+        let spans = sections::plan(&Params::default(), &sections, d.len() + 1);
+        let resolved = resolve(&detect(&d, 10.0, &spans), &CutEdits::default(), d.len() + 1);
+        let scenes = super::build(&d, d.len() + 1, &resolved.cuts, &spans);
+        let got: Vec<_> = scenes.iter().map(|s| (s.keep.clone(), s.kind)).collect();
+        assert_eq!(got, [(0..10, SceneKind::Video), (11..18, SceneKind::Video), (20..30, SceneKind::Video)]);
+    }
+
+    #[test]
+    fn locked_sections_ignore_setting_changes() {
+        let mut sections = Sections::default();
+        let id = sections.add(15..30).unwrap();
+        let before = bounds_with(&sections, &Params::default());
+        // Lock with the cuts and settings the section has now.
+        let spans = sections::plan(&Params::default(), &sections, 30);
+        let frozen = detect(&sample(), 10.0, &spans).iter().filter(|d| (15..30).contains(&d.id)).map(|d| (d.id, d.frame as usize)).collect();
+        sections.get_mut(id).unwrap().lock = Some(Lock { params: spans[1].params.clone(), cuts: frozen });
+
+        // A threshold nothing passes removes every cut, except inside the locked section.
+        let strict = Params { mode: DetectMode::Fixed, cut_threshold: 255.0, cut_offset: 5, ..Params::default() };
+        assert_eq!(bounds_with(&sections, &strict), [(CutId::Start, 0, 20), (CutId::Detected(20), 20, 30)]);
+        assert_eq!(bounds_with(&sections, &Params::default()), before);
+    }
+
+    #[test]
+    fn locked_cuts_survive_changes_next_to_the_section() {
+        // Spikes at frames 10 (weak) and 13 (strong), 3 frames apart; scenes must be 5 frames.
+        let mut d = vec![0.5; 29];
+        d[9] = 40.0;
+        d[12] = 80.0;
+        let global = Params { mode: DetectMode::Fixed, cut_threshold: 50.0, ..Params::default() };
+        let mut sections = Sections::default();
+        let id = sections.add(12..30).unwrap();
+        let cuts = |sections: &Sections, global: &Params| {
+            detect(&d, 10.0, &sections::plan(global, sections, 30)).iter().map(|c| c.id).collect::<Vec<_>>()
+        };
+        assert_eq!(cuts(&sections, &global), [13]);
+        sections.get_mut(id).unwrap().lock = Some(Lock { params: global.clone(), cuts: [(13, 13)].into() });
+
+        // Now the whole video finds frame 10 too, which would make 13 too close. The lock keeps it.
+        let looser = Params { cut_threshold: 30.0, ..global.clone() };
+        assert_eq!(cuts(&Sections::default(), &looser), [10]);
+        assert_eq!(cuts(&sections, &looser), [10, 13]);
     }
 
     /// Sweeps every setting and edit across (and beyond) its UI range on videos of awkward

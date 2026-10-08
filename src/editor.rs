@@ -1,10 +1,11 @@
 //! Cut editing widgets: the zoomable difference graph with draggable cut markers, the
-//! editing toolbar, and the filmstrip around the selected cut.
+//! editing toolbar, the bars under the video (sections and scenes), and the filmstrip
+//! around the selected cut.
 //!
 //! Widgets don't change app state directly; they return [`Action`]s that the app applies.
 
 use std::collections::HashMap;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 
 use eframe::egui::{
     self, Color32, CursorIcon, Event, FontId, Key, Modifiers, Rect, RichText, Sense, Shape, Stroke, TextureHandle,
@@ -13,11 +14,13 @@ use eframe::egui::{
 
 use crate::project::Edits;
 use crate::scenes::{Cut, CutId, CutSource, ResolvedCuts, Scene, SceneKind};
+use crate::sections::Sections;
 
 pub const DETECTED_COLOR: Color32 = Color32::from_rgb(230, 120, 40);
 pub const MOVED_COLOR: Color32 = Color32::from_rgb(240, 200, 60);
 pub const MANUAL_COLOR: Color32 = Color32::from_rgb(190, 110, 230);
 const SELECTED_COLOR: Color32 = Color32::from_rgb(255, 255, 255);
+pub const SECTION_COLOR: Color32 = Color32::from_rgb(40, 170, 160);
 
 /// Frames shown on each side of the selected cut in the filmstrip.
 pub const STRIP_RADIUS: usize = 6;
@@ -36,6 +39,7 @@ pub const SHORTCUTS: &str = "Space  play / pause\n\
     [ ]  jump to previous / next cut\n\
     Esc  deselect cut\n\
     Ctrl+Z / Ctrl+Shift+Z  undo / redo\n\
+    Shift+click a scene  select a range of scenes\n\
     \n\
     Graph: drag a marker to move it (Alt: no snapping),\n\
     double-click to add a cut, right-click for more,\n\
@@ -50,6 +54,8 @@ pub enum Action {
     SelectScene { index: usize, play: bool },
     /// Select scene by index and move the playhead to `frame` inside it.
     SelectSceneAt { index: usize, frame: usize },
+    /// Extend the scene selection to the scene at this index (Shift+click).
+    ExtendSelection(usize),
     SelectCut(Option<CutId>),
     /// Record an undo step before an edit gesture (e.g. at the start of a drag).
     Checkpoint,
@@ -72,6 +78,14 @@ pub enum Action {
     ZoomToSelectedScene,
     SetKind(CutId, SceneKind),
     SetExcluded(CutId, bool),
+    /// Choose which section the settings panel edits (`None`: the whole video).
+    SelectSection(Option<u32>),
+    /// Make a section from the selected scenes.
+    NewSection,
+    DeleteSection(u32),
+    /// Resize a section. Doesn't record an undo step by itself.
+    SetSectionRange { id: u32, start: usize, end: usize },
+    ToggleLock(u32),
 }
 
 /// Actions for this frame's key presses. Nothing while a widget (e.g. a number field) has
@@ -119,6 +133,8 @@ pub struct EditorView {
     pub end: f64,
     frame_count: f64,
     dragging: Option<CutId>,
+    /// Section edge being dragged in the sections bar: (section, true for its start edge).
+    dragging_edge: Option<(u32, bool)>,
     context: Option<ContextTarget>,
     last_playhead: usize,
 }
@@ -132,7 +148,7 @@ enum ContextTarget {
 impl EditorView {
     pub fn new(frame_count: usize) -> Self {
         let fc = frame_count.max(1) as f64;
-        Self { start: 0.0, end: fc, frame_count: fc, dragging: None, context: None, last_playhead: 0 }
+        Self { start: 0.0, end: fc, frame_count: fc, dragging: None, dragging_edge: None, context: None, last_playhead: 0 }
     }
 
     fn span(&self) -> f64 {
@@ -191,8 +207,11 @@ pub struct GraphInput<'a> {
     pub fps: f64,
     pub playhead: usize,
     pub selected_cut: Option<CutId>,
-    /// Horizontal reference line (the active detection threshold).
-    pub threshold: f32,
+    /// Horizontal reference lines (the detection threshold), per stretch of frames.
+    /// `None` where detection doesn't run (locked sections).
+    pub thresholds: Vec<(Range<usize>, Option<f32>)>,
+    /// Sections to shade, and whether each is the one being edited.
+    pub sections: Vec<(Range<usize>, bool)>,
 }
 
 pub fn cut_color(source: CutSource) -> Color32 {
@@ -217,6 +236,11 @@ pub fn graph(ui: &mut egui::Ui, view: &mut EditorView, input: &GraphInput<'_>) -
 
     let span = view.span();
     let x_of = |f: f64| rect.left() + ((f - view.start) / span) as f32 * rect.width();
+    let x_range = |r: &Range<usize>| x_of(r.start as f64).max(rect.left())..=x_of(r.end as f64).min(rect.right());
+    for (range, selected) in &input.sections {
+        let shade = SECTION_COLOR.gamma_multiply(if *selected { 0.22 } else { 0.1 });
+        painter.rect_filled(Rect::from_x_y_ranges(x_range(range), rect.y_range()), 0.0, shade);
+    }
     let f_of = |x: f32| view.start + ((x - rect.left()) / rect.width()) as f64 * span;
     let px_per_frame = rect.width() as f64 / span;
     let diff_at = |boundary: usize| -> f32 {
@@ -246,7 +270,11 @@ pub fn graph(ui: &mut egui::Ui, view: &mut EditorView, input: &GraphInput<'_>) -
         }
     }
 
-    painter.hline(rect.x_range(), to_y(input.threshold), Stroke::new(1.0, Color32::from_rgb(70, 130, 200)));
+    for (range, threshold) in &input.thresholds {
+        if let Some(t) = threshold {
+            painter.hline(x_range(range), to_y(*t), Stroke::new(1.0, Color32::from_rgb(70, 130, 200)));
+        }
+    }
 
     // Deleted detected cuts and the original positions of moved cuts, dashed.
     let dashed = |f: usize, color: Color32| {
@@ -485,7 +513,8 @@ pub const STILL_COLOR: Color32 = Color32::from_rgb(90, 170, 110);
 pub struct OverviewInput<'a> {
     pub scenes: &'a [Scene],
     pub edits: &'a Edits,
-    pub selected: Option<CutId>,
+    /// Indices of the selected scenes.
+    pub selected: Option<RangeInclusive<usize>>,
     pub frame_count: usize,
     pub fps: f64,
     /// Frame on screen in the player.
@@ -498,7 +527,8 @@ pub const OVERVIEW_HEIGHT: f32 = 22.0;
 
 /// The bar under the video: every scene's exported frames (blue = clip, green = still,
 /// faded = not exported), the selected scene, the graph's zoom window, and the playhead.
-/// Click a clip to select it (the playhead moves to the click); drag to scrub.
+/// Click a clip to select it (the playhead moves to the click), Shift+click to select a range;
+/// drag to scrub.
 pub fn overview(ui: &mut egui::Ui, input: &OverviewInput<'_>, view: &EditorView) -> Option<Action> {
     let total = input.frame_count.max(1);
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), OVERVIEW_HEIGHT), Sense::click_and_drag());
@@ -524,7 +554,7 @@ pub fn overview(ui: &mut egui::Ui, input: &OverviewInput<'_>, view: &EditorView)
                 .shrink2(vec2(0.5, 3.0));
             painter.rect_filled(r, 1.0, color.gamma_multiply(alpha));
         }
-        if input.selected == Some(scene.id) {
+        if input.selected.as_ref().is_some_and(|r| r.contains(&i)) {
             let r = full.shrink2(vec2(0.5, 1.0));
             painter.rect_stroke(r, 2.0, Stroke::new(2.0, DETECTED_COLOR), egui::StrokeKind::Inside);
         }
@@ -539,7 +569,7 @@ pub fn overview(ui: &mut egui::Ui, input: &OverviewInput<'_>, view: &EditorView)
 
     let response = match hovered.and_then(|i| input.scenes.get(i).map(|s| (i, s))) {
         Some((i, s)) if !response.dragged() => response.on_hover_text(format!(
-            "Scene #{}  {} – {}\nClick to select, drag to scrub",
+            "Scene #{}  {} – {}\nClick to select (Shift: a range), drag to scrub",
             i + 1,
             fmt_time(s.start as f64 / input.fps),
             fmt_time(s.end as f64 / input.fps),
@@ -548,7 +578,9 @@ pub fn overview(ui: &mut egui::Ui, input: &OverviewInput<'_>, view: &EditorView)
     };
 
     let frame = frame_at(response.interact_pointer_pos()?.x);
-    if response.clicked() {
+    if response.clicked() && ui.input(|i| i.modifiers.shift) {
+        Some(Action::ExtendSelection(scene_at(frame)))
+    } else if response.clicked() {
         Some(Action::SelectSceneAt { index: scene_at(frame), frame })
     } else if response.dragged() && frame != input.position {
         // Only seek when the frame changes, so holding still doesn't restart the decoder.
@@ -556,6 +588,120 @@ pub fn overview(ui: &mut egui::Ui, input: &OverviewInput<'_>, view: &EditorView)
     } else {
         None
     }
+}
+
+pub struct SectionsInput<'a> {
+    pub sections: &'a Sections,
+    /// The section being edited.
+    pub selected: Option<u32>,
+    pub frame_count: usize,
+    pub fps: f64,
+    /// Frames section edges snap to (the cuts).
+    pub snap_to: &'a [usize],
+}
+
+pub const SECTIONS_HEIGHT: f32 = 16.0;
+
+/// The bar above the scene overview showing the sections. Click one to edit its settings
+/// (empty space: the whole video), drag an edge to resize it (snaps to cuts; Alt: no snapping).
+pub fn sections_bar(ui: &mut egui::Ui, input: &SectionsInput<'_>, view: &mut EditorView) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let total = input.frame_count.max(1) as f32;
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), SECTIONS_HEIGHT), Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    let to_x = |frame: usize| rect.left() + frame as f32 / total * rect.width();
+    let frame_at = |x: f32| (((x - rect.left()) / rect.width() * total).round().max(0.0) as usize).min(input.frame_count);
+    let list = &input.sections.list;
+
+    // Edges of unlocked sections can be dragged.
+    let edge_near = |x: f32| {
+        list.iter()
+            .filter(|s| s.lock.is_none())
+            .flat_map(|s| [(s.id, true, to_x(s.start)), (s.id, false, to_x(s.end))])
+            .map(|(id, start, ex)| (id, start, (ex - x).abs()))
+            .filter(|e| e.2 <= GRAB_PX)
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(id, start, _)| (id, start))
+    };
+    let pointer = response.hover_pos();
+    let hovered_edge = pointer.and_then(|p| edge_near(p.x));
+    let section_at = |x: f32| {
+        let f = ((x - rect.left()) / rect.width() * total).max(0.0) as usize;
+        list.iter().find(|s| (s.start..s.end).contains(&f))
+    };
+
+    for (i, s) in list.iter().enumerate() {
+        let r = Rect::from_x_y_ranges(to_x(s.start)..=to_x(s.end).max(to_x(s.start) + 2.0), rect.y_range());
+        let selected = input.selected == Some(s.id);
+        painter.rect_filled(r.shrink2(vec2(0.0, 1.0)), 2.0, SECTION_COLOR.gamma_multiply(if selected { 0.85 } else { 0.45 }));
+        if selected {
+            painter.rect_stroke(r, 2.0, Stroke::new(1.5, SELECTED_COLOR), egui::StrokeKind::Inside);
+        }
+        let label = if s.lock.is_some() { format!("🔒{}", i + 1) } else { format!("{}", i + 1) };
+        if r.width() > 24.0 {
+            painter.text(r.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(11.0), Color32::WHITE);
+        }
+    }
+    if let Some((id, start)) = hovered_edge.or(view.dragging_edge) {
+        if let Some(s) = input.sections.get(id) {
+            let x = to_x(if start { s.start } else { s.end });
+            painter.vline(x, rect.y_range(), Stroke::new(2.0, SELECTED_COLOR));
+        }
+    }
+
+    let response = if hovered_edge.is_some() || view.dragging_edge.is_some() {
+        response.on_hover_cursor(CursorIcon::ResizeHorizontal)
+    } else if let Some(s) = pointer.and_then(|p| section_at(p.x)) {
+        let n = input.sections.number(s.id).unwrap_or(0);
+        let state = match (&s.lock, s.overrides.count()) {
+            (Some(_), _) => "locked".to_owned(),
+            (None, 0) => "no settings changed yet".to_owned(),
+            (None, k) => format!("{k} settings changed"),
+        };
+        response.on_hover_text(format!(
+            "Section {n}: {} – {} · {state}\nClick to edit its settings, drag an edge to resize",
+            fmt_time(s.start as f64 / input.fps),
+            fmt_time(s.end as f64 / input.fps),
+        ))
+    } else {
+        response.on_hover_text("Sections: parts of the video with their own settings.\nSelect scenes, then “New section” in the settings.")
+    };
+
+    if response.drag_started() {
+        let origin = ui.input(|i| i.pointer.press_origin()).map(|p| p.x);
+        view.dragging_edge = origin.and_then(edge_near);
+        if let Some((id, _)) = view.dragging_edge {
+            actions.push(Action::Checkpoint);
+            actions.push(Action::SelectSection(Some(id)));
+        }
+    }
+    if response.dragged() {
+        let x = response.interact_pointer_pos().map(|p| p.x);
+        if let (Some((id, start)), Some(x)) = (view.dragging_edge, x) {
+            if let Some(s) = input.sections.get(id) {
+                let raw = frame_at(x);
+                let alt = ui.input(|i| i.modifiers.alt);
+                let snapped = input
+                    .snap_to
+                    .iter()
+                    .chain(&[0, input.frame_count])
+                    .copied()
+                    .filter(|&f| (to_x(f) - x).abs() <= SNAP_PX)
+                    .min_by(|&a, &b| (to_x(a) - x).abs().total_cmp(&(to_x(b) - x).abs()));
+                let frame = if alt { raw } else { snapped.unwrap_or(raw) };
+                let (start, end) = if start { (frame, s.end) } else { (s.start, frame) };
+                actions.push(Action::SetSectionRange { id, start, end });
+            }
+        }
+    }
+    if response.drag_stopped() {
+        view.dragging_edge = None;
+    }
+    if response.clicked() && hovered_edge.is_none() {
+        actions.push(Action::SelectSection(pointer.and_then(|p| section_at(p.x)).map(|s| s.id)));
+    }
+    actions
 }
 
 pub struct StripInput<'a> {

@@ -84,39 +84,44 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # Two archives: one with ffmpeg next to the app, and the app alone for people who
+      # already have ffmpeg on PATH.
       - name: Package
-        id: package
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             version="$GITHUB_REF_NAME"
           else
             version="dev-${GITHUB_SHA::7}"
           fi
-          name="scenesplit-$version-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp README.md THIRD-PARTY-NOTICES.md licenses/ffmpeg-GPL-3.0.txt "dist/$name/"
-          # Next to the executable, where the app looks before PATH.
-          cp ffmpeg-bundle/* "dist/$name/"
-          if [[ "${{ matrix.test }}" == true ]]; then
-            "dist/$name/ffmpeg" -version | head -1
-          fi
           bin="target/${{ matrix.target }}/release/scenesplit"
-          cd dist
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp "../$bin.exe" "$name/"
-            7z a "$name.zip" "$name" > /dev/null
-            echo "archive=dist/$name.zip" >> "$GITHUB_OUTPUT"
-          else
-            # tar keeps the executable bit, which upload-artifact's zip would drop.
-            cp "../$bin" "$name/"
-            tar czf "$name.tar.gz" "$name"
-            echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
-          fi
+          [[ "${{ runner.os }}" == "Windows" ]] && bin="$bin.exe"
+          for variant in with-ffmpeg no-ffmpeg; do
+            name="scenesplit-$version-${{ matrix.target }}-$variant"
+            mkdir -p "dist/$name"
+            cp README.md "$bin" "dist/$name/"
+            if [[ "$variant" == with-ffmpeg ]]; then
+              cp THIRD-PARTY-NOTICES.md licenses/ffmpeg-GPL-3.0.txt "dist/$name/"
+              # Next to the executable, where the app looks before PATH.
+              cp ffmpeg-bundle/* "dist/$name/"
+              if [[ "${{ matrix.test }}" == true ]]; then
+                "dist/$name/ffmpeg" -version | head -1
+              fi
+            fi
+            if [[ "${{ runner.os }}" == "Windows" ]]; then
+              (cd dist && 7z a "$name.zip" "$name" > /dev/null)
+            else
+              # tar keeps the executable bit, which upload-artifact's zip would drop.
+              tar czf "dist/$name.tar.gz" -C dist "$name"
+            fi
+          done
+          ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: scenesplit-${{ matrix.target }}
-          path: ${{ steps.package.outputs.archive }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
           if-no-files-found: error
 
   release:
